@@ -138,10 +138,23 @@ jobs:
 
           cfg = json.loads((root / 'config.json').read_text(encoding='utf-8'))
           assert cfg['version'] == '1.0.1' and cfg['sample_rate'] == 48000
-          required = ('foreign_dict.json', 'foreign_parts.json', 'known_words.json', 'english_i.json')
-          for fname in required:
+          # The normalizer emits two mappings and two sorted word lists.
+          expected_dictionaries = {
+              'foreign_dict.json': dict,
+              'foreign_parts.json': dict,
+              'known_words.json': list,
+              'english_i.json': list,
+          }
+          required = tuple(expected_dictionaries)
+          for fname, expected_type in expected_dictionaries.items():
               data = json.loads((models / fname).read_text(encoding='utf-8'))
-              assert isinstance(data, dict) and len(data) > 100, (fname, len(data))
+              assert isinstance(data, expected_type), (fname, type(data).__name__)
+              assert len(data) > 100, (fname, len(data))
+              if isinstance(data, list):
+                  assert all(isinstance(word, str) and word for word in data), fname
+                  assert data == sorted(set(data)), f'{fname} must be sorted and unique'
+              else:
+                  assert all(isinstance(k, str) and isinstance(v, str) for k, v in data.items()), fname
 
           model_id = 'cloud0day3/antalia-mini'
           rev = os.environ['ANTALIA_MODEL_REVISION']
