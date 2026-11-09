@@ -1,0 +1,182 @@
+name: Antalia-2 Mini 1.0.1 - quality ONNX export
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - .github/workflows/antalia-mini-onnx.yml
+
+permissions:
+  contents: read
+
+concurrency:
+  group: antalia-mini-onnx-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  convert:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout Sherpa-ONNX fork
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Checkout pinned Antalia converter
+        env:
+          EXPORTER_COMMIT: 459585b3bf67db5db5d9ec03d394d9b2c95412f2
+          EXPORTER_BLOB: 12062c8e57bfefa70e7b73d959e2e50926878f82
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/fr0stb1rd/antalia-mini-web.git "$RUNNER_TEMP/antalia-converter"
+          git -C "$RUNNER_TEMP/antalia-converter" checkout --detach "$EXPORTER_COMMIT"
+          test "$(git -C "$RUNNER_TEMP/antalia-converter" rev-parse HEAD)" = "$EXPORTER_COMMIT"
+          test "$(git -C "$RUNNER_TEMP/antalia-converter" hash-object export_onnx.py)" = "$EXPORTER_BLOB"
+
+      - name: Install pinned CPU conversion dependencies
+        run: |
+          set -euo pipefail
+          python -m pip install --upgrade pip
+          python -m pip install --index-url https://download.pytorch.org/whl/cpu 'torch==2.6.0'
+          python -m pip install             'numpy==1.26.4' 'onnx==1.17.0' 'onnxruntime==1.21.0'             'onnxscript==0.2.6' 'safetensors==0.5.3'             'huggingface_hub==0.30.2' 'cmudict==1.0.32'
+
+      - name: Resolve immutable Antalia-2 Mini 1.0.1 model revision
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+          from huggingface_hub import HfApi, hf_hub_download
+          model = 'cloud0day3/antalia-mini'
+          revision = HfApi().model_info(model, revision='main').sha
+          cfg_path = hf_hub_download(model, 'config.json', revision=revision)
+          cfg = json.loads(Path(cfg_path).read_text(encoding='utf-8'))
+          assert cfg['version'] == '1.0.1', f"Unexpected version: {cfg['version']}"
+          assert cfg['sample_rate'] == 48000, cfg['sample_rate']
+          assert cfg['defaults']['steps'] == 8, cfg['defaults']
+          assert float(cfg['defaults']['cfg']) == 2.0, cfg['defaults']
+          with open(os.environ['GITHUB_ENV'], 'a', encoding='utf-8') as out:
+              out.write(f'ANTALIA_MODEL_REVISION={revision}\n')
+          print('Validated Antalia version 1.0.1, revision', revision)
+          PY
+
+      - name: Pin exporter downloads to resolved model revision
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import os
+          from pathlib import Path
+          script = Path(os.environ['RUNNER_TEMP']) / 'antalia-converter' / 'export_onnx.py'
+          code = script.read_text(encoding='utf-8')
+          original = 'hf_hub_download(repo, fname, local_dir=str(cache_dir))'
+          replacement = "hf_hub_download(repo, fname, revision=os.environ['ANTALIA_MODEL_REVISION'], local_dir=str(cache_dir))"
+          assert code.count(original) == 1, 'Exporter source layout changed; refusing unsafe patch'
+          script.write_text(code.replace(original, replacement), encoding='utf-8')
+          PY
+
+      - name: Export FP32 text + 8-step CFG2 acoustic + FP32 vocoder
+        working-directory: ${{ runner.temp }}/antalia-converter
+        env:
+          ANTALIA_MODEL_REPO: cloud0day3/antalia-mini
+          OMP_NUM_THREADS: '2'
+          MKL_NUM_THREADS: '2'
+        run: |
+          set -euo pipefail
+          python export_onnx.py --check --steps 8 --cfg 2.0
+
+      - name: Verify graph signatures, multiple lengths, provenance and licenses
+        working-directory: ${{ runner.temp }}/antalia-converter
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import hashlib, json, os, shutil
+          from pathlib import Path
+          import numpy as np
+          import onnx
+          import onnxruntime as ort
+          from huggingface_hub import hf_hub_download
+
+          root = Path.cwd()
+          models = root / 'models'
+          expected = {
+              'text_stage': (['ids', 'mask'], ['h', 'logd']),
+              'sound_stage': (['cond', 'fmask', 'noise'], ['mel']),
+              'decoder': (['mel'], ['audio']),
+          }
+          sessions = {}
+          for name, (inputs, outputs) in expected.items():
+              path = models / f'{name}.onnx'
+              assert path.is_file() and path.stat().st_size > 50000, path
+              onnx.checker.check_model(str(path), full_check=True)
+              session = ort.InferenceSession(str(path), providers=['CPUExecutionProvider'])
+              assert [i.name for i in session.get_inputs()] == inputs, name
+              assert [o.name for o in session.get_outputs()] == outputs, name
+              sessions[name] = session
+
+          for n in (7, 31, 73):
+              ids = np.full((1, n), 12, dtype=np.int64)
+              mask = np.ones((1, n), dtype=np.bool_)
+              h, logd = sessions['text_stage'].run(None, {'ids': ids, 'mask': mask})
+              assert h.shape == (1, n, 192) and logd.shape == (1, n)
+              assert np.isfinite(h).all() and np.isfinite(logd).all()
+          rng = np.random.default_rng(20261109)
+          for frames in (32, 64, 96):
+              cond = rng.normal(size=(1, frames, 192)).astype(np.float32)
+              fmask = np.ones((1, frames), dtype=np.bool_)
+              noise = rng.normal(size=(1, frames // 2, 256)).astype(np.float32)
+              mel = sessions['sound_stage'].run(None, {'cond': cond, 'fmask': fmask, 'noise': noise})[0]
+              assert mel.shape == (1, 128, frames) and np.isfinite(mel).all()
+              audio = sessions['decoder'].run(None, {'mel': mel})[0]
+              assert audio.ndim == 2 and audio.shape[0] == 1 and audio.shape[1] > frames * 256
+              assert np.isfinite(audio).all()
+              print(f'Pass dynamic frames={frames}, audio samples={audio.shape[1]}')
+
+          cfg = json.loads((root / 'config.json').read_text(encoding='utf-8'))
+          assert cfg['version'] == '1.0.1' and cfg['sample_rate'] == 48000
+          required = ('foreign_dict.json', 'foreign_parts.json', 'known_words.json', 'english_i.json')
+          for fname in required:
+              data = json.loads((models / fname).read_text(encoding='utf-8'))
+              assert isinstance(data, dict) and len(data) > 100, (fname, len(data))
+
+          model_id = 'cloud0day3/antalia-mini'
+          rev = os.environ['ANTALIA_MODEL_REVISION']
+          out = root / 'antalia-1.0.1-fp32-onnx'
+          out.mkdir(exist_ok=True)
+          for p in [*(models / f'{name}.onnx' for name in expected),
+                    *(models / fname for fname in required), root / 'vocab.json', root / 'config.json']:
+              shutil.copy2(p, out / p.name)
+          for fname in ('LICENSE', 'NOTICE', 'antalia_mini-1.0.1-py3-none-any.whl'):
+              src = hf_hub_download(model_id, fname, revision=rev)
+              shutil.copy2(src, out / fname)
+
+          # ONNX outputs raw 48 kHz PCM. The 1.0.1 EQ/de-esser/limiter is NOT
+          # inside these graphs: keep the exact official Python wheel for the
+          # upcoming Android post-processing port and auditory parity tests.
+          hashes = {p.name: hashlib.sha256(p.read_bytes()).hexdigest() for p in sorted(out.iterdir()) if p.is_file()}
+          metadata = {
+              'model': model_id, 'model_revision': rev, 'version': '1.0.1',
+              'converter_repo': 'fr0stb1rd/antalia-mini-web',
+              'converter_commit': '459585b3bf67db5db5d9ec03d394d9b2c95412f2',
+              'float_precision': 'fp32', 'sample_rate': 48000,
+              'flow_steps': 8, 'cfg': 2.0,
+              'audio_output': 'raw PCM - official 1.0.1 EQ/de-esser/makeup/limiter required in Android',
+              'sha256': hashes,
+          }
+          (out / 'provenance.json').write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding='utf-8')
+          print('Verified model graphs, dictionaries, provenance, and official 1.0.1 wheel')
+          PY
+          sha256sum antalia-1.0.1-fp32-onnx/*.onnx
+
+      - name: Upload validated ONNX package (not an Android APK)
+        uses: actions/upload-artifact@v4
+        with:
+          name: antalia-2-mini-1.0.1-fp32-onnx
+          path: ${{ runner.temp }}/antalia-converter/antalia-1.0.1-fp32-onnx/
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
