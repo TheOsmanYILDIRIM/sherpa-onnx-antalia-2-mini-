@@ -1,0 +1,124 @@
+name: Antalia-2 Mini 1.0.1 Android TTS experiment
+
+on:
+  push:
+    branches:
+      - experiment/antalia-android-1.0.1-20261110
+    paths:
+      - .github/workflows/antalia-android-experiment.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  android:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - name: Checkout Sherpa-ONNX fork
+        uses: actions/checkout@v4
+
+      - name: Checkout existing Antalia Android integration (pinned)
+        uses: actions/checkout@v4
+        with:
+          repository: TheOsmanYILDIRIM/HayaiTTS
+          ref: 74f8cd4534a55d570ce3b2dbfe962e698421205d
+          path: hayai-android
+          lfs: true
+
+      - name: Download verified 1.0.1 model from our successful conversion
+        uses: actions/download-artifact@v4
+        with:
+          name: antalia-2-mini-1.0.1-fp32-onnx
+          repository: TheOsmanYILDIRIM/sherpa-onnx-antalia-2-mini-
+          run-id: 42702032039
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/antalia-onnx
+
+      - name: Install and verify Antalia model and original normalizer
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          import json
+          import pathlib
+          import shutil
+
+          source = pathlib.Path('${{ runner.temp }}/antalia-onnx')
+          target = pathlib.Path('hayai-android/app/src/main/assets/antalia')
+          meta = json.loads((source / 'provenance.json').read_text(encoding='utf-8'))
+          assert meta['version'] == '1.0.1'
+          assert meta['model_revision'] == '0965f4a5fb578763be8ca2a2bb39421378471cd1'
+          assert meta['flow_steps'] == 8 and meta['cfg'] == 2.0
+          required = (
+              'text_stage.onnx', 'sound_stage.onnx', 'decoder.onnx',
+              'foreign_dict.json', 'foreign_parts.json', 'known_words.json', 'english_i.json',
+              'config.json', 'vocab.json', 'LICENSE', 'NOTICE',
+          )
+          target.mkdir(parents=True, exist_ok=True)
+          for name in required:
+              item = source / name
+              assert item.is_file() and item.stat().st_size > 0, name
+              expected_sha = meta['sha256'][name]
+              actual_sha = hashlib.sha256(item.read_bytes()).hexdigest()
+              assert actual_sha == expected_sha, name
+              shutil.copy2(item, target / name)
+          cfg = json.loads((target / 'config.json').read_text(encoding='utf-8'))
+          assert cfg['version'] == '1.0.1'
+          assert cfg['sample_rate'] == 48000
+          print('Pinned FP32 model and dictionary SHA-256 verified')
+          PY
+          curl --fail --location --silent --show-error \
+            --output hayai-android/app/src/main/assets/antalia/normalize.js \
+            https://raw.githubusercontent.com/fr0stb1rd/antalia-mini-web/459585b3bf67db5db5d9ec03d394d9b2c95412f2/normalize.js
+
+      - name: Repair prototype Android WebView normalizer
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path('hayai-android/app/src/main/java/dev/ahmedmohamed/hayaitts/data/antalia/AntaliaWebNormalizer.kt')
+          content = path.read_text(encoding='utf-8')
+          anchor = 'val web = WebView(context.applicationContext)'
+          assert content.count(anchor) == 1, 'Unexpected normalizer implementation'
+          content = content.replace(anchor, anchor + '\n            web.settings.javaScriptEnabled = true')
+          path.write_text(content, encoding='utf-8')
+          assert content.count('web.settings.javaScriptEnabled = true') == 1
+          PY
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install Android 36 platform without legacy setup-android action
+        shell: bash
+        run: |
+          set -euo pipefail
+          command -v sdkmanager
+          sdkmanager --install "platforms;android-36" "build-tools;36.0.0"
+
+      - name: Configure Gradle
+        uses: gradle/actions/setup-gradle@v4
+
+      - name: Run Android unit tests and build debug APK
+        working-directory: hayai-android
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x gradlew
+          ./gradlew :app:testDebugUnitTest :app:assembleDebug --stacktrace --no-daemon
+
+      - name: Upload experimental APK
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: antalia-2-mini-1.0.1-android-experimental
+          path: hayai-android/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+          retention-days: 14
