@@ -122,7 +122,12 @@ jobs:
                       kept.append(weight)
                       continue
                   arr = numpy_helper.to_array(weight)
-                  if arr.ndim < 2 or arr.size < 512:
+                  # Preserve critical input, spectral head and final ConvNeXt
+                  # block at FP32: phase errors amplify after the inverse STFT.
+                  sensitive = src.stem == 'decoder' and any(
+                      tag in weight.name for tag in ('inp.', 'head.', 'blocks.7.')
+                  )
+                  if arr.ndim < 2 or arr.size < 512 or sensitive:
                       kept.append(weight)
                       continue
                   assert np.isfinite(arr).all()
