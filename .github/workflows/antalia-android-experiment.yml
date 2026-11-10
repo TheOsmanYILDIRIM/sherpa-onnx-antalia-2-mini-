@@ -101,7 +101,7 @@ jobs:
           changes = {
               # ABI splits already filter native libraries. A second ndk abiFilter
               # conflicts with Android Gradle Plugin when both select arm64-v8a.
-              '        ndk {\\n            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")\\n        }\\n':
+              chr(10).join(("        ndk {", '            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")', "        }", "")):
                   '',
               'include("arm64-v8a", "armeabi-v7a", "x86_64")':
                   'include("arm64-v8a")',
