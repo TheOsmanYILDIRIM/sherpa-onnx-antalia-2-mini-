@@ -67,7 +67,7 @@ public final class MainActivity extends Activity {
     }
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
-        engine=new AntaliaCore(this);
+        engine=AntaliaCore.shared(this);
         getWindow().setSoftInputMode(WindowManager.LayoutParams.SOFT_INPUT_ADJUST_RESIZE);
         ScrollView scroll=new ScrollView(this);
         LinearLayout page=new LinearLayout(this);
@@ -138,6 +138,18 @@ public final class MainActivity extends Activity {
             send.putExtra(Intent.EXTRA_TEXT,results);
             startActivity(Intent.createChooser(send,"Hız testini paylaş"));
         });
+        // Start loading selected models immediately while the user reads/enters text.
+        // Uses the same serial worker as Speak/Benchmark and the process-wide core.
+        final int warmSteps = fastMode.isChecked() ? 4 : 8;
+        final int warmThreads = threads;
+        worker.execute(() -> {
+            try {
+                engine.prepare(warmSteps, warmThreads);
+                message("Motor hazır. Seslendirmeye başlayabilirsiniz.");
+            } catch (Exception e) {
+                message("Motor hazırlama hatası: " + e.getMessage());
+            }
+        });
     }
     private void stopPlayback() {
         cancelled.set(true);
@@ -203,6 +215,9 @@ public final class MainActivity extends Activity {
             try {
                 for(int steps:new int[]{8,4})for(int n:new int[]{1,4}) {
                     if(cancelled.get())break;
+                    // Prepare before timing to measure real synthesis rather than repeatedly
+                    // reopening all ONNX graphs during the same benchmark.
+                    engine.prepare(steps,n);
                     final long start=SystemClock.elapsedRealtimeNanos();
                     final long[] first={-1},samples={0};
                     message("Test: "+steps+" adım · "+n+" iş parçacığı");
@@ -230,7 +245,7 @@ public final class MainActivity extends Activity {
     }
     @Override public void onDestroy() {
         cancelled.set(true);worker.shutdownNow();
-        if(engine!=null)engine.close();
+        // The shared engine also serves the Android system TTS service.
         super.onDestroy();
     }
 }

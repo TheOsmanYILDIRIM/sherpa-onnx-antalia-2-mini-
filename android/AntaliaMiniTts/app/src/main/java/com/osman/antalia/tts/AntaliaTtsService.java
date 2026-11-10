@@ -19,7 +19,17 @@ public final class AntaliaTtsService extends TextToSpeechService {
 
     @Override public void onCreate() {
         super.onCreate();
-        core = new AntaliaCore(this);
+        core = AntaliaCore.shared(this);
+        // Prepare models on a background thread before Android's first synthesis request.
+        new Thread(() -> {
+            try {
+                int steps = getSharedPreferences("antalia_settings", MODE_PRIVATE).getBoolean("fast", true) ? 4 : 8;
+                int threads = getSharedPreferences("antalia_settings", MODE_PRIVATE).getInt("threads", 4);
+                core.prepare(steps, threads);
+            } catch (Exception e) {
+                android.util.Log.w("AntaliaTtsService", "Early model initialization failed", e);
+            }
+        }, "antalia-tts-prepare").start();
     }
 
     @Override protected String[] onGetLanguage() {
@@ -93,7 +103,7 @@ public final class AntaliaTtsService extends TextToSpeechService {
 
     @Override public void onDestroy() {
         cancelled.set(true);
-        if(core!=null)core.close();
+        // Retain model sessions for subsequent service and UI requests in this process.
         super.onDestroy();
     }
 }

@@ -37,11 +37,18 @@ final class AntaliaCore implements AutoCloseable {
     private File modelDir;
     private JSONObject dictionary;
     private OrtSession text;
-    private OrtSession sound8;
-    private OrtSession sound4;
+    private OrtSession sound;
     private OrtSession decoder;
     private OrtSession.SessionOptions options;
     private int currentThreads = -1;
+    private int currentSteps = -1;
+    private static AntaliaCore singleton;
+
+    /** One engine per app process; shared with Android TTS service. */
+    static synchronized AntaliaCore shared(Context context) {
+        if (singleton == null) singleton = new AntaliaCore(context);
+        return singleton;
+    }
 
     interface AudioSink { boolean deliver(float[] audio); }
 
@@ -115,32 +122,54 @@ final class AntaliaCore implements AutoCloseable {
     }
 
     private void closeSessions() {
-        closeSession(decoder); closeSession(sound4); closeSession(sound8); closeSession(text);
-        decoder = sound4 = sound8 = text = null;
+        closeSession(sound); closeSession(decoder); closeSession(text);
+        sound = decoder = text = null;
         if (options != null) try { options.close(); } catch (Exception ignored) {}
         options = null;
         currentThreads = -1;
+        currentSteps = -1;
     }
 
-    private void open(int threads) throws Exception {
+    private void open(int steps, int threads) throws Exception {
+        if (steps != 4 && steps != 8) throw new IllegalArgumentException("Steps must be 4 or 8");
         if (threads != 1 && threads != 2 && threads != 4) throw new IllegalArgumentException("Threads must be 1, 2 or 4");
         install();
-        if (currentThreads == threads && text != null) return;
-        closeSessions();
-        options = new OrtSession.SessionOptions();
-        options.setIntraOpNumThreads(threads);
-        options.setInterOpNumThreads(1);
-        options.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT);
-        try {
-            text = env.createSession(new File(modelDir, "text_stage.onnx").getAbsolutePath(), options);
-            sound8 = env.createSession(new File(modelDir, "sound_stage.onnx").getAbsolutePath(), options);
-            sound4 = env.createSession(new File(modelDir, "sound_stage_4.onnx").getAbsolutePath(), options);
-            decoder = env.createSession(new File(modelDir, "decoder.onnx").getAbsolutePath(), options);
-            currentThreads = threads;
-        } catch (Exception e) {
+        // Critical cold-start fix: do not initialize both flow graphs.
+        // Reuse common text/vocoder sessions when switching 4/8 steps.
+        if (currentThreads != threads || text == null || decoder == null) {
             closeSessions();
-            throw e;
+            options = new OrtSession.SessionOptions();
+            options.setIntraOpNumThreads(threads);
+            options.setInterOpNumThreads(1);
+            options.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT);
+            try {
+                text = env.createSession(new File(modelDir, "text_stage.onnx").getAbsolutePath(), options);
+                decoder = env.createSession(new File(modelDir, "decoder.onnx").getAbsolutePath(), options);
+                currentThreads = threads;
+            } catch (Exception e) {
+                closeSessions();
+                throw e;
+            }
         }
+        if (sound == null || currentSteps != steps) {
+            closeSession(sound);
+            sound = null;
+            currentSteps = -1;
+            try {
+                String name = steps == 4 ? "sound_stage_4.onnx" : "sound_stage.onnx";
+                sound = env.createSession(new File(modelDir, name).getAbsolutePath(), options);
+                currentSteps = steps;
+            } catch (Exception e) {
+                closeSessions();
+                throw e;
+            }
+        }
+    }
+
+    /** Called on the background executor when app/service starts; no playback. */
+    synchronized void prepare(int steps, int threads) throws Exception {
+        open(steps, threads);
+        normalizer.prepare();
     }
 
     private long[] tokens(String normalized) throws Exception {
@@ -248,7 +277,7 @@ final class AntaliaCore implements AutoCloseable {
         try (OnnxTensor c = OnnxTensor.createTensor(env,FloatBuffer.wrap(cond),new long[]{1,frames,HIDDEN});
              OnnxTensor m = OnnxTensor.createTensor(env,ByteBuffer.wrap(fmask),new long[]{1,frames},OnnxJavaType.BOOL);
              OnnxTensor z = OnnxTensor.createTensor(env,FloatBuffer.wrap(noise),new long[]{1,frames/STACK,BINS*STACK});
-             OrtSession.Result out=(steps==4?sound4:sound8).run(feed("cond",c,"fmask",m,"noise",z))) {
+             OrtSession.Result out=sound.run(feed("cond",c,"fmask",m,"noise",z))) {
             mel=((float[][][])out.get("mel").orElseThrow().getValue())[0];
         }
         if(mel.length!=BINS)throw new IllegalStateException("Mel dimension mismatch");
@@ -284,7 +313,7 @@ final class AntaliaCore implements AutoCloseable {
         if(steps!=4&&steps!=8)throw new IllegalArgumentException("Unsupported flow steps");
         if(!Float.isFinite(speed)||speed<=0)throw new IllegalArgumentException("Invalid speed");
         if(raw==null||raw.trim().isEmpty())return;
-        open(threads);
+        open(steps,threads);
         Tone tone=new Tone();
         List<String> parts=chunks(raw);
         for(int i=0;i<parts.size();i++) {

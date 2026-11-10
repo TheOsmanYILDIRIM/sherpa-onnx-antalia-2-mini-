@@ -12,10 +12,15 @@ import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 
-/** Executes the pinned upstream normalize.js and dictionaries in Android WebView. */
+/**
+ * One reusable in-process Chromium normalizer, initialized once.
+ * Must be used off main thread; WebView itself remains main-thread-owned.
+ */
 final class AntaliaNormalizer {
     private final Context context;
     private final Handler main = new Handler(Looper.getMainLooper());
+    private WebView view;
+    private volatile boolean ready;
 
     AntaliaNormalizer(Context context) { this.context = context.getApplicationContext(); }
 
@@ -29,44 +34,64 @@ final class AntaliaNormalizer {
         }
     }
 
-    String normalize(String text) throws Exception {
-        if (Looper.myLooper() == Looper.getMainLooper()) {
-            throw new IllegalStateException("Normalizer must run off the UI thread");
-        }
+    void prepare() throws Exception {
+        if (ready) return;
+        if (Looper.myLooper() == Looper.getMainLooper())
+            throw new IllegalStateException("Antalia normalizer preparation must not block UI");
         CountDownLatch latch = new CountDownLatch(1);
-        AtomicReference<String> value = new AtomicReference<>();
         AtomicReference<Throwable> error = new AtomicReference<>();
         main.post(() -> {
-            WebView web = null;
             try {
-                web = new WebView(context);
-                web.getSettings().setJavaScriptEnabled(true);
-                final WebView view = web;
+                if (view == null) {
+                    view = new WebView(context);
+                    view.getSettings().setJavaScriptEnabled(true);
+                }
                 String boot = asset("normalize.js")
                     + "\nAntaliaText.setData({foreign:" + asset("foreign_dict.json")
                     + ",parts:" + asset("foreign_parts.json")
                     + ",known:" + asset("known_words.json")
-                    + ",englishI:" + asset("english_i.json") + "});";
-                view.evaluateJavascript(boot, ignored -> {
-                    view.evaluateJavascript("AntaliaText.toModelText(" + JSONObject.quote(text) + ")", js -> {
-                        try {
-                            Object decoded = new JSONTokener(js).nextValue();
-                            if (!(decoded instanceof String)) throw new IllegalStateException("Invalid normalizer output");
-                            value.set((String) decoded);
-                        } catch (Throwable e) { error.set(e); }
-                        finally { view.destroy(); latch.countDown(); }
-                    });
+                    + ",englishI:" + asset("english_i.json") + "});"
+                    + "\nBoolean(typeof AntaliaText !== 'undefined' && typeof AntaliaText.toModelText === 'function')";
+                view.evaluateJavascript(boot, js -> {
+                    if ("true".equals(js)) ready = true;
+                    else error.set(new IllegalStateException("Antalia normalize.js initialization failed: " + js));
+                    latch.countDown();
                 });
             } catch (Throwable e) {
                 error.set(e);
-                if (web != null) web.destroy();
+                if (view != null) { view.destroy(); view = null; }
                 latch.countDown();
             }
         });
-        if (!latch.await(45, TimeUnit.SECONDS)) throw new IllegalStateException("Antalia normalize.js timeout");
-        if (error.get() != null) throw new IllegalStateException("Antalia text normalizer failed", error.get());
-        String result = value.get();
-        if (result == null) throw new IllegalStateException("Empty normalizer callback");
-        return result;
+        if (!latch.await(45, TimeUnit.SECONDS)) throw new IllegalStateException("Antalia normalizer initialization timed out");
+        if (error.get() != null) throw new IllegalStateException("Antalia normalizer initialization error", error.get());
+    }
+
+    String normalize(String text) throws Exception {
+        if (Looper.myLooper() == Looper.getMainLooper())
+            throw new IllegalStateException("Antalia normalizer must run off UI thread");
+        prepare();
+        CountDownLatch latch = new CountDownLatch(1);
+        AtomicReference<String> value = new AtomicReference<>();
+        AtomicReference<Throwable> error = new AtomicReference<>();
+        main.post(() -> {
+            try {
+                view.evaluateJavascript("AntaliaText.toModelText(" + JSONObject.quote(text) + ")", js -> {
+                    try {
+                        Object decoded = new JSONTokener(js).nextValue();
+                        if (!(decoded instanceof String)) throw new IllegalStateException("Invalid Antalia normalizer output");
+                        value.set((String) decoded);
+                    } catch (Throwable e) { error.set(e); }
+                    finally { latch.countDown(); }
+                });
+            } catch (Throwable e) {
+                error.set(e);
+                latch.countDown();
+            }
+        });
+        if (!latch.await(45, TimeUnit.SECONDS)) throw new IllegalStateException("Antalia normalize.js response timed out");
+        if (error.get() != null) throw new IllegalStateException("Antalia normalizer failed", error.get());
+        if (value.get() == null) throw new IllegalStateException("Empty Antalia normalize.js result");
+        return value.get();
     }
 }
