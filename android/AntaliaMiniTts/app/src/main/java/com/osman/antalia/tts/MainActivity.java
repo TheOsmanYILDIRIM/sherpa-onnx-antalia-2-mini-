@@ -2,6 +2,11 @@ package com.osman.antalia.tts;
 
 import android.app.Activity;
 import android.content.Intent;
+import android.content.pm.PackageManager;
+import android.net.Uri;
+import android.os.Build;
+import android.provider.Settings;
+import android.Manifest;
 import android.media.AudioFormat;
 import android.media.AudioManager;
 import android.media.AudioTrack;
@@ -28,12 +33,12 @@ public final class MainActivity extends Activity {
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final AtomicBoolean cancelled = new AtomicBoolean(false);
     private AntaliaCore engine;
-    private AudioTrack track;
     private TextView status;
     private EditText input;
     private Switch fastMode;
     private RadioGroup threadChoices;
     private Button speakButton, stopButton, testButton, shareButton;
+    private Switch keepAlive;
     private String results = "";
     private int threads = 4;
 
@@ -96,7 +101,7 @@ public final class MainActivity extends Activity {
         fastMode.setChecked(getSharedPreferences(PREFS,MODE_PRIVATE).getBoolean("fast",true));
         fastMode.setOnCheckedChangeListener((v,yes) -> getSharedPreferences(PREFS,MODE_PRIVATE).edit().putBoolean("fast",yes).apply());
         page.addView(fastMode);
-        page.addView(title("8 adım daha doğal olabilir; 4 adım daha hızlıdır. Aynı model, gerçek iki ayrı ses grafiği.",13));
+        page.addView(title("8 adım daha doğal olabilir; 4 adım daha hızlıdır. Aynı flow grafiği farklı sayıda çalıştırılır.",13));
         page.addView(title("İşlemci iş parçacıkları",20));
         threadChoices=new RadioGroup(this);
         threadChoices.setOrientation(RadioGroup.HORIZONTAL);
@@ -119,6 +124,46 @@ public final class MainActivity extends Activity {
         });
         page.addView(threadChoices);
         page.addView(title("Bu telefonda "+Runtime.getRuntime().availableProcessors()+" işlemci çekirdeği var. Daha çok iş parçacığı her zaman daha hızlı olmayabilir.",13));
+        page.addView(title("Arka plan · Termux yöntemi",23));
+        keepAlive = new Switch(this);
+        keepAlive.setText("Ekran kapalıyken TTS motorunu hazır tut");
+        keepAlive.setTextSize(18);
+        keepAlive.setChecked(AntaliaBackgroundService.isGuardActive());
+        page.addView(keepAlive);
+        page.addView(title("Termux gibi kalıcı bildirim + işlemci WakeLock kullanır. Açıkken pil tüketimi artabilir. Sistem uygulamayı yine de durdurabilir.",13));
+        Button battery = new Button(this);
+        battery.setText("Tecno / Android pil yönetimi");
+        page.addView(battery);
+        battery.setOnClickListener(v -> {
+            try {
+                startActivity(new Intent(Settings.ACTION_IGNORE_BATTERY_OPTIMIZATION_SETTINGS));
+            } catch (Exception unavailable) {
+                startActivity(new Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS,
+                    Uri.parse("package:" + getPackageName())));
+            }
+        });
+        final boolean[] syncingToggle = {false};
+        keepAlive.setOnCheckedChangeListener((button, enabled) -> {
+            if (syncingToggle[0]) return;
+            try {
+                Intent cmd = AntaliaBackgroundService.command(this, enabled
+                    ? AntaliaBackgroundService.ACTION_GUARD_ON
+                    : AntaliaBackgroundService.ACTION_GUARD_OFF);
+                if (enabled) {
+                    startForegroundService(cmd);   // user is in a visible Activity
+                    requestNotificationPermission();
+                    message("Arka plan koruması açık. Bildirimden kapatabilirsiniz.");
+                } else {
+                    startService(cmd);
+                    message("Arka plan koruması kapalı.");
+                }
+            } catch (Exception error) {
+                syncingToggle[0] = true;
+                keepAlive.setChecked(!enabled);
+                syncingToggle[0] = false;
+                message("Arka plan servisi başlatılamadı: " + error.getMessage());
+            }
+        });
         page.addView(title("Hız testi",23));
         page.addView(title("8 ve 4 adımda, 1 ve 4 iş parçacığıyla ilk sese kadar süreyi ve toplam hızı ölçer. Test sırasında ekranı açık tutun.",14));
         testButton=new Button(this);testButton.setText("Hız testini başlat");
@@ -151,60 +196,41 @@ public final class MainActivity extends Activity {
             }
         });
     }
+    private void requestNotificationPermission() {
+        if (Build.VERSION.SDK_INT >= 33
+            && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED)
+            requestPermissions(new String[]{Manifest.permission.POST_NOTIFICATIONS}, 77);
+    }
+
     private void stopPlayback() {
-        cancelled.set(true);
-        if(track!=null) try { track.pause();track.flush(); } catch(Exception ignored){}
-        message("Durduruldu.");
+        // Preview AudioTrack belongs to the long-running service, not this Activity.
+        try {
+            startService(AntaliaBackgroundService.command(this,
+                AntaliaBackgroundService.ACTION_STOP_READ));
+            message("Okuma durduruluyor.");
+            stopButton.setEnabled(false);
+        } catch (Exception e) {
+            message("Durdurulamadı: " + e.getMessage());
+        }
     }
-    private AudioTrack newTrack() {
-        int size=AudioTrack.getMinBufferSize(AntaliaCore.RATE,AudioFormat.CHANNEL_OUT_MONO,AudioFormat.ENCODING_PCM_16BIT);
-        AudioTrack t=new AudioTrack(AudioManager.STREAM_MUSIC,AntaliaCore.RATE,
-            AudioFormat.CHANNEL_OUT_MONO,AudioFormat.ENCODING_PCM_16BIT,Math.max(16384,size),AudioTrack.MODE_STREAM);
-        if(t.getState()!=AudioTrack.STATE_INITIALIZED)throw new IllegalStateException("AudioTrack init failed");
-        t.play();
-        return t;
-    }
+
     private void speak() {
-        String source=input.getText().toString();
-        if(source.trim().isEmpty()){message("Lütfen metin girin.");return;}
-        cancelled.set(false);
-        boolean fast=fastMode.isChecked();
-        int n=threads;
-        busy(true);
-        message("Modeller hazırlanıyor; seslendirme başlatılıyor…");
-        worker.execute(() -> {
-            PowerManager.WakeLock lock=null;
-            try {
-                PowerManager power=(PowerManager)getSystemService(POWER_SERVICE);
-                lock=power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK,"antalia:preview");
-                lock.acquire(10*60*1000L);
-                track=newTrack();
-                long start=SystemClock.elapsedRealtimeNanos();
-                AtomicBoolean first=new AtomicBoolean(false);
-                engine.speak(source,fast?4:8,n,.95f,cancelled,audio -> {
-                    if(cancelled.get())return false;
-                    if(first.compareAndSet(false,true))message(String.format(Locale.ROOT,
-                        "İlk ses: %.2f sn · %d adım · %d iş parçacığı",
-                        (SystemClock.elapsedRealtimeNanos()-start)/1e9,fast?4:8,n));
-                    byte[] bytes=pcm(audio);
-                    int offset=0;
-                    while(offset<bytes.length&&!cancelled.get()) {
-                        int take=Math.min(16384,bytes.length-offset);
-                        int written=track.write(bytes,offset,take);
-                        if(written<=0)return false;
-                        offset+=written;
-                    }
-                    return !cancelled.get();
-                });
-                if(!cancelled.get())message("Seslendirme tamamlandı.");
-            } catch(Exception e) { message("Seslendirme hatası: "+e.getMessage()); }
-            finally {
-                if(track!=null){try {track.stop();}catch(Exception ignored){}track.release();track=null;}
-                if(lock!=null&&lock.isHeld())lock.release();
-                busy(false);
-            }
-        });
+        String speech = input.getText().toString();
+        if (speech.trim().isEmpty()) { message("Lütfen metin girin."); return; }
+        Intent cmd = AntaliaBackgroundService.command(this, AntaliaBackgroundService.ACTION_READ);
+        cmd.putExtra(AntaliaBackgroundService.EXTRA_TEXT, speech);
+        cmd.putExtra(AntaliaBackgroundService.EXTRA_STEPS, fastMode.isChecked() ? 4 : 8);
+        cmd.putExtra(AntaliaBackgroundService.EXTRA_THREADS, threads);
+        try {
+            startForegroundService(cmd); // visible/user-initiated; no background-start bypass
+            requestNotificationPermission();
+            stopButton.setEnabled(true);
+            message("Seslendirme arka plan servisinde başladı. Ekranı kapatabilirsiniz.");
+        } catch (Exception e) {
+            message("Seslendirme başlatılamadı: " + e.getMessage());
+        }
     }
+
     private void benchmark() {
         cancelled.set(false);
         busy(true);
