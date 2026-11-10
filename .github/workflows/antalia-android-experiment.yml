@@ -125,7 +125,10 @@ jobs:
                   # Preserve critical input, spectral head and final ConvNeXt
                   # block at FP32: phase errors amplify after the inverse STFT.
                   sensitive = src.stem == 'decoder' and any(
-                      tag in weight.name for tag in ('inp.', 'head.', 'blocks.7.')
+                      tag in weight.name for tag in (
+                          'inp.', 'head.', 'blocks.0.', 'blocks.1.',
+                          'blocks.6.', 'blocks.7.',
+                      )
                   )
                   if arr.ndim < 2 or arr.size < 512 or sensitive:
                       kept.append(weight)
