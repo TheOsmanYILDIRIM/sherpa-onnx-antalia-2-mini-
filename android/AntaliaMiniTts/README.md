@@ -56,3 +56,26 @@ Outstanding tests: Tecno Android 15, screen off/on, leaving Activity, one-hour
 long reading, external TTS client, notification actions, user stop,
 battery drain, OEM task-kill and notification-denied behavior.
 GitHub Actions success establishes build/packaging only.
+
+
+## External Android TTS reader continuity (Novela / Moon+ Reader)
+
+The app's own preview and the Android system TTS protocol take different paths. Reader
+apps can send short text fragments as distinct synthesis requests; they control request
+timing and may independently insert pauses. The Android engine now suppresses the
+previous hard-coded 60/120 ms *intra-request* chunk silence, while preserving the
+existing preview playback behavior. This does not claim to join separate Android
+requests or override the reader app's playback sequencing.
+
+Privacy-preserving timing records use the `AntaliaTtsTiming` Android log tag:
+request sequence, character count, ending punctuation flag, interval since prior
+callback return, first PCM latency, synthesis duration, PCM duration and chunk count.
+No book text is logged. These metrics help distinguish TTS latency from reader-
+controlled pauses; `gapFromPreviousMs` is request-start minus previous callback
+return, **not** the audible gap measured at the speaker. Log output is an optional
+diagnostic, not a guaranteed cure. Model graphs, sound settings and background
+foreground-service behavior are not changed in this revision.
+
+Acceptance pending: real Novela and Moon+ Reader listening comparisons with identical
+text and speech rate, screen on/off, and optionally `adb logcat -s
+AntaliaTtsTiming:I` from a connected host. GitHub CI is not a device test.

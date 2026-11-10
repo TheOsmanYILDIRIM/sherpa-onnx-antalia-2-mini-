@@ -355,6 +355,13 @@ final class AntaliaCore implements AutoCloseable {
 
     synchronized void speak(String raw, int steps, int threads, float speed,
                             AtomicBoolean stop, AudioSink sink) throws Exception {
+        speak(raw, steps, threads, speed, stop, sink, true);
+    }
+
+    /** External Android TTS requests suppress synthetic intra-request pauses.
+     * The reader itself controls when successive requests are spoken. */
+    synchronized void speak(String raw, int steps, int threads, float speed,
+                            AtomicBoolean stop, AudioSink sink, boolean addPauses) throws Exception {
         if(steps!=4&&steps!=8)throw new IllegalArgumentException("Unsupported flow steps");
         if(!Float.isFinite(speed)||speed<=0)throw new IllegalArgumentException("Invalid speed");
         if(raw==null||raw.trim().isEmpty())return;
@@ -367,7 +374,7 @@ final class AntaliaCore implements AutoCloseable {
             if(cleaned.isBlank())continue;
             float[] audio=tone.process(infer(cleaned,steps,speed,i));
             if(!sink.deliver(audio))break;
-            if(i!=parts.size()-1 && !stop.get()) {
+            if(addPauses && i!=parts.size()-1 && !stop.get()) {
                 char tail=parts.get(i).charAt(parts.get(i).length()-1);
                 int pause=(tail=='.'||tail=='!'||tail=='?')?5760:2880;
                 if(!sink.deliver(new float[pause]))break;
