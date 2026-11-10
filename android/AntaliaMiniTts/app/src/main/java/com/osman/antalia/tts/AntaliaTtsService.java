@@ -36,7 +36,7 @@ public final class AntaliaTtsService extends TextToSpeechService {
         return onIsLanguageAvailable(lang,country,variant);
     }
 
-    @Override protected List<Voice> onGetVoices() {
+    @Override public List<Voice> onGetVoices() {
         Voice voice = new Voice("antalia-mini-tr-TR", new Locale("tr","TR"),
             Voice.QUALITY_NORMAL,Voice.LATENCY_NORMAL,false,
             Collections.singleton("offline"));
