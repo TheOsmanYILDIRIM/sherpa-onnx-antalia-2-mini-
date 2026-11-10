@@ -21,7 +21,7 @@ jobs:
       - name: Checkout Sherpa-ONNX fork directly (no HayaiTTS)
         uses: actions/checkout@v4
 
-      - name: Download verified Antalia 1.0.1 eight-step model
+      - name: Download validated 1.0.1 text frontend assets
         uses: actions/download-artifact@v4
         with:
           name: antalia-2-mini-1.0.1-fp32-onnx
@@ -30,216 +30,15 @@ jobs:
           github-token: ${{ github.token }}
           path: ${{ runner.temp }}/antalia-onnx
 
-      - name: Verify pinned model and prepare minimal Android assets
+      - name: Fetch and validate original four split ONNX graphs
         shell: bash
         run: |
           set -euo pipefail
-          python3 - <<'PY'
-          import json, hashlib, shutil
-          from pathlib import Path
-          source=Path('${{ runner.temp }}/antalia-onnx')
-          dest=Path('android/AntaliaMiniTts/app/src/main/assets/antalia')
-          dest.mkdir(parents=True,exist_ok=True)
-          meta=json.loads((source/'provenance.json').read_text(encoding='utf-8'))
-          assert meta['version']=='1.0.1'
-          assert meta['model_revision']=='0965f4a5fb578763be8ca2a2bb39421378471cd1'
-          assert meta['flow_steps']==8 and float(meta['cfg'])==2.0
-          for file in ('text_stage.onnx','sound_stage.onnx','decoder.onnx',
-                       'vocab.json','config.json','foreign_dict.json',
-                       'foreign_parts.json','known_words.json','english_i.json',
-                       'LICENSE','NOTICE'):
-              obj=source/file
-              assert obj.is_file() and obj.stat().st_size>0,file
-              assert hashlib.sha256(obj.read_bytes()).hexdigest()==meta['sha256'][file],file
-              shutil.copy2(obj,dest/file)
-          print('Pinned 1.0.1 model SHA-256 verified')
-          PY
-          curl --fail --location --silent --show-error \
-            --output android/AntaliaMiniTts/app/src/main/assets/antalia/normalize.js \
-            https://raw.githubusercontent.com/fr0stb1rd/antalia-mini-web/459585b3bf67db5db5d9ec03d394d9b2c95412f2/normalize.js
-
-      - name: Install 4-step exporter dependencies and pin source
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 -m pip install --upgrade pip
-          python3 -m pip install --index-url https://download.pytorch.org/whl/cpu 'torch==2.6.0'
-          python3 -m pip install 'numpy==1.26.4' 'onnx==1.17.0' 'onnxruntime==1.21.0' \
-            'onnxscript==0.2.6' 'safetensors==0.5.3' 'huggingface_hub==0.30.2' 'cmudict==1.0.32'
-          git clone --filter=blob:none https://github.com/fr0stb1rd/antalia-mini-web.git "${{ runner.temp }}/antalia-converter"
-          git -C "${{ runner.temp }}/antalia-converter" checkout --detach 459585b3bf67db5db5d9ec03d394d9b2c95412f2
-          test "$(git -C "${{ runner.temp }}/antalia-converter" hash-object export_onnx.py)" = 12062c8e57bfefa70e7b73d959e2e50926878f82
-          python3 - <<'PY'
-          from pathlib import Path
-          file=Path('${{ runner.temp }}/antalia-converter/export_onnx.py')
-          src=file.read_text(encoding='utf-8')
-          old='hf_hub_download(repo, fname, local_dir=str(cache_dir))'
-          new="hf_hub_download(repo, fname, revision='0965f4a5fb578763be8ca2a2bb39421378471cd1', local_dir=str(cache_dir))"
-          assert src.count(old)==1
-          file.write_text(src.replace(old,new),encoding='utf-8')
-          PY
-
-      - name: Export and PyTorch-check true four-step CFG2 sound graph
-        shell: bash
-        working-directory: ${{ runner.temp }}/antalia-converter
-        env:
-          ANTALIA_MODEL_REPO: cloud0day3/antalia-mini
-          OMP_NUM_THREADS: '2'
-          MKL_NUM_THREADS: '2'
-        run: |
-          set -euo pipefail
-          python3 export_onnx.py --check --steps 4 --cfg 2.0
-
-      - name: Add independently exported four-step graph and pinned hash
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          import hashlib, json, shutil
-          from pathlib import Path
-          src=Path('${{ runner.temp }}/antalia-converter/models/sound_stage.onnx')
-          dst=Path('${{ runner.temp }}/antalia-onnx/sound_stage_4.onnx')
-          assert src.is_file() and src.stat().st_size>100000
-          shutil.copy2(src,dst)
-          meta_path=Path('${{ runner.temp }}/antalia-onnx/provenance.json')
-          meta=json.loads(meta_path.read_text(encoding='utf-8'))
-          meta['sha256']['sound_stage_4.onnx']=hashlib.sha256(dst.read_bytes()).hexdigest()
-          meta['four_step_exporter_commit']='459585b3bf67db5db5d9ec03d394d9b2c95412f2'
-          meta['four_step_validation']='PyTorch parity via export_onnx.py --check --steps 4 --cfg 2.0'
-          meta_path.write_text(json.dumps(meta,indent=2),encoding='utf-8')
-          print('Verified genuine four-step sound_stage_4.onnx')
-          PY
-
-      - name: Quantize 1.0.1 ONNX weights to per-channel INT8 and verify parity
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 -m pip install 'onnx==1.17.0' 'onnxruntime==1.21.0' 'numpy==1.26.4'
-          python3 - <<'PY'
-          import hashlib
-          import json
-          from pathlib import Path
-          import numpy as np
-          import onnx
-          import onnxruntime as ort
-          from onnx import TensorProto, helper, numpy_helper
-
-          source = Path('${{ runner.temp }}/antalia-onnx')
-          target = Path('android/AntaliaMiniTts/app/src/main/assets/antalia')
-          metadata = json.loads((source / 'provenance.json').read_text())
-          assert metadata['version'] == '1.0.1'
-          stages = ('text_stage', 'sound_stage', 'sound_stage_4', 'decoder')
-          sessions = {}
-          summary = {}
-          def convert(src, dst):
-              model = onnx.load(str(src))
-              assert any(x.domain == '' and x.version >= 13 for x in model.opset_import)
-              protected = {x.name for x in model.graph.input}
-              kept, added, dq_nodes = [], [], []
-              count = 0
-              for i, weight in enumerate(model.graph.initializer):
-                  if weight.data_type != TensorProto.FLOAT or weight.name in protected:
-                      kept.append(weight)
-                      continue
-                  arr = numpy_helper.to_array(weight)
-                  # Preserve critical input, spectral head and final ConvNeXt
-                  # block at FP32: phase errors amplify after the inverse STFT.
-                  sensitive = src.stem == 'decoder' and any(
-                      tag in weight.name for tag in (
-                          'inp.', 'head.', 'blocks.0.', 'blocks.1.',
-                          'blocks.6.', 'blocks.7.',
-                      )
-                  )
-                  if arr.ndim < 2 or arr.size < 512 or sensitive:
-                      kept.append(weight)
-                      continue
-                  assert np.isfinite(arr).all()
-                  scale = np.maximum(np.abs(arr).max(axis=tuple(range(1, arr.ndim))) / 127, 1e-8).astype('float32')
-                  q = np.clip(np.rint(arr / scale.reshape((-1,) + (1,) * (arr.ndim-1))), -127, 127).astype('int8')
-                  prefix = 'antalia_int8_' + str(i)
-                  qname, sname, zname = prefix+'_w', prefix+'_scale', prefix+'_zero'
-                  added.extend([
-                      numpy_helper.from_array(q, name=qname),
-                      numpy_helper.from_array(scale, name=sname),
-                      numpy_helper.from_array(np.zeros(len(scale), dtype='int8'), name=zname),
-                  ])
-                  dq_nodes.append(helper.make_node('DequantizeLinear', [qname,sname,zname],
-                                                   [weight.name], name=prefix+'_dq', axis=0))
-                  count += arr.size
-              assert count > 100000, (src.name, count)
-              model.graph.ClearField('initializer')
-              model.graph.initializer.extend(kept + added)
-              for i, node in enumerate(dq_nodes):
-                  model.graph.node.insert(i, node)
-              onnx.checker.check_model(model, full_check=True)
-              onnx.save(model, str(dst))
-              assert dst.stat().st_size < src.stat().st_size * .8, src.name
-              return count
-
-          for stage in stages:
-              original = source / (stage + '.onnx')
-              result = target / (stage + '.onnx')
-              assert hashlib.sha256(original.read_bytes()).hexdigest() == metadata['sha256'][original.name]
-              count = convert(original, result)
-              sessions[stage] = (
-                  ort.InferenceSession(str(original), providers=['CPUExecutionProvider']),
-                  ort.InferenceSession(str(result), providers=['CPUExecutionProvider']),
-              )
-              old, new = sessions[stage]
-              assert [(x.name,x.type) for x in old.get_inputs()] == [(x.name,x.type) for x in new.get_inputs()]
-              assert [(x.name,x.type) for x in old.get_outputs()] == [(x.name,x.type) for x in new.get_outputs()]
-              summary[stage] = {
-                  'original_bytes': original.stat().st_size,
-                  'int8_bytes': result.stat().st_size,
-                  'quantized_elements': count,
-                  'sha256': hashlib.sha256(result.read_bytes()).hexdigest(),
-              }
-          rng = np.random.default_rng(20261110)
-          data = {
-              'text_stage': {
-                  'ids': np.array([[1]+[12,13,14,15]*4+[2]],dtype='int64'),
-                  'mask': np.ones((1,18),dtype='bool'),
-              },
-              'sound_stage': {
-                  'cond': rng.normal(0,.5,(1,64,192)).astype('float32'),
-                  'fmask': np.ones((1,64),dtype='bool'),
-                  'noise': rng.normal(0,.6,(1,32,256)).astype('float32'),
-              },
-          }
-          data['sound_stage_4'] = data['sound_stage']
-          data['sound_stage_4'] = data['sound_stage']
-          data['decoder'] = {'mel': sessions['sound_stage'][0].run(None,data['sound_stage'])[0]}
-          thresholds = {'text_stage': 28., 'sound_stage': 22., 'sound_stage_4': 22., 'decoder': 25.}
-          for stage in stages:
-              expected = sessions[stage][0].run(None,data[stage])
-              actual = sessions[stage][1].run(None,data[stage])
-              metrics = []
-              for x,y in zip(expected,actual):
-                  assert x.shape == y.shape and np.isfinite(y).all(), stage
-                  x,y = x.astype('float64'),y.astype('float64')
-                  signal = np.sqrt(np.mean(x*x))
-                  error = np.sqrt(np.mean((x-y)**2))
-                  snr = float(20*np.log10(max(signal,1e-8)/max(error,1e-12)))
-                  metrics.append(round(snr,2))
-              summary[stage]['snr_db'] = metrics
-              assert min(metrics) >= thresholds[stage], (stage,metrics)
-              print(stage, summary[stage])
-          before = sum(v['original_bytes'] for v in summary.values())
-          after = sum(v['int8_bytes'] for v in summary.values())
-          assert after < before*.65, (before, after)
-          (target/'quantization.json').write_text(json.dumps({
-              'base':'cloud0day3/antalia-mini',
-              'base_revision':metadata['model_revision'],
-              'version':'1.0.1',
-              'weight_format':'symmetric per-channel INT8 QDQ',
-              'model_sizes_before_bytes':before,
-              'model_sizes_after_bytes':after,
-              'stage_tests':summary,
-              'numerical_parity_verified':True,
-              'audio_listening_quality_and_device_test_pending':True,
-          },indent=2), encoding='utf-8')
-          print('INT8 weight conversion verified:',before,'->',after)
-          PY
+          python3 -m pip install --disable-pip-version-check \
+            'huggingface_hub==0.30.2' 'onnxruntime==1.21.0' 'numpy==1.26.4'
+          python3 android/AntaliaMiniTts/prepare_models.py \
+            "${{ runner.temp }}/antalia-onnx" \
+            "android/AntaliaMiniTts/app/src/main/assets/antalia"
 
       - name: Set up JDK 21
         uses: actions/setup-java@v4
@@ -270,43 +69,45 @@ jobs:
           set -euo pipefail
           gradle -p android/AntaliaMiniTts :app:assembleDebug --stacktrace --no-daemon
 
-      - name: Assert exactly one ARM64 APK, real 4/8 models and no Hayai or Sherpa duplicate
+      - name: Verify ARM64 APK contains exact four-stage original models
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import json,hashlib
-          from zipfile import ZipFile
+          import hashlib,json
           from pathlib import Path
+          from zipfile import ZipFile
           apks=list(Path('android/AntaliaMiniTts/app/build/outputs/apk/debug').glob('*.apk'))
           assert len(apks)==1,apks
-          p=apks[0]
-          with ZipFile(p) as z:
+          apk=apks[0]
+          with ZipFile(apk) as z:
               assert z.testzip() is None
               names=z.namelist()
               abis={n.split('/')[1] for n in names if n.startswith('lib/') and len(n.split('/'))>2}
               assert abis=={'arm64-v8a'},abis
-              so=[n for n in names if n.endswith('.so')]
-              assert any('libonnxruntime.so' in n for n in so),so
-              assert not any('sherpa' in n.lower() or 'hayai' in n.lower() for n in names)
-              libs=[n for n in names if n.startswith('lib/') and n.endswith('.so')]
-              assert libs and all(z.getinfo(n).compress_type==8 for n in libs), 'Native libraries not compressed in APK'
-              for f in ('text_stage.onnx','sound_stage.onnx','sound_stage_4.onnx',
-                        'decoder.onnx','normalize.js','vocab.json','quantization.json'):
-                  assert 'assets/antalia/'+f in names,f
-              info=json.loads(z.read('assets/antalia/quantization.json'))
-              assert info['version']=='1.0.1'
-              assert set(info['stage_tests'])=={'text_stage','sound_stage','sound_stage_4','decoder'}
-              print('ONNX sizes:',info['model_sizes_before_bytes'],info['model_sizes_after_bytes'])
-          assert p.stat().st_size < 35000000, f'APK exceeds 35 MB: {p.stat().st_size} bytes'
-          print('Validated single-arm64 APK',p,'size',p.stat().st_size,
-                'SHA256',hashlib.sha256(p.read_bytes()).hexdigest())
+              assert any('libonnxruntime.so' in x for x in names)
+              assert not any('sherpa' in x.lower() or 'hayai' in x.lower() for x in names)
+              libs=[x for x in names if x.startswith('lib/') and x.endswith('.so')]
+              assert libs and all(z.getinfo(x).compress_type==8 for x in libs)
+              meta=json.loads(z.read('assets/antalia/graph_manifest.json'))
+              assert meta['model_version']=='1.0.1'
+              assert meta['space_revision']=='2c24b406fedada11bd731a2ec9f4535bfd354f03'
+              assert set(meta['sha256'])=={'text.onnx','cond.onnx','flow.onnx','vocoder.fp16.onnx'}
+              for name,digest in meta['sha256'].items():
+                  assert hashlib.sha256(z.read('assets/antalia/'+name)).hexdigest()==digest,name
+              for name in ('normalize.js','vocab.json','foreign_dict.json','foreign_parts.json',
+                           'known_words.json','english_i.json'):
+                  assert 'assets/antalia/'+name in names,name
+              assert 'assets/antalia/decoder.onnx' not in names
+          assert apk.stat().st_size < 35000000,f'APK exceeds 35 MB: {apk.stat().st_size}'
+          print('Verified original split ARM64 APK',apk,apk.stat().st_size,
+                hashlib.sha256(apk.read_bytes()).hexdigest())
           PY
 
       - name: Upload only the compact ARM64 APK
         uses: actions/upload-artifact@v4
         with:
-          name: antalia-mini-1.0.1-sherpa-fork-arm64-compact
+          name: antalia-mini-1.0.1-sherpa-fork-arm64-original-split
           path: android/AntaliaMiniTts/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 14

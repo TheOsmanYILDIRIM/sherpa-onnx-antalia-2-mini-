@@ -232,6 +232,7 @@ public final class MainActivity extends Activity {
                     report.append(String.format(Locale.ROOT,
                         "%d adım / %d iş: ilk ses %.3f sn · toplam %.3f sn · RTF %.3f\n",
                         steps,n,firstSec,total,duration>0?total/duration:Double.NaN));
+                    report.append("    ").append(engine.lastProfile()).append("\n");
                 }
                 results=report.toString();
                 message(results);

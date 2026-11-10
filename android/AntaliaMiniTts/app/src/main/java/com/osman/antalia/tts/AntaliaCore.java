@@ -37,8 +37,10 @@ final class AntaliaCore implements AutoCloseable {
     private File modelDir;
     private JSONObject dictionary;
     private OrtSession text;
-    private OrtSession sound;
-    private OrtSession decoder;
+    private OrtSession conditioning;
+    private OrtSession flow;
+    private OrtSession vocoder;
+    private volatile String lastProfile = "";
     private OrtSession.SessionOptions options;
     private int currentThreads = -1;
     private int currentSteps = -1;
@@ -80,20 +82,19 @@ final class AntaliaCore implements AutoCloseable {
 
     private void install() throws Exception {
         if (modelDir != null) return;
-        File dir = new File(context.getFilesDir(), "antalia_101_int8");
+        File dir = new File(context.getFilesDir(), "antalia_101_split_fp16");
         if (!dir.exists() && !dir.mkdirs()) throw new IllegalStateException("Cannot create private model directory");
-        String[] models = {"text_stage", "sound_stage", "sound_stage_4", "decoder"};
+        String[] models = {"text.onnx", "cond.onnx", "flow.onnx", "vocoder.fp16.onnx"};
         String manifest;
-        try (InputStream in = context.getAssets().open("antalia/quantization.json")) {
+        try (InputStream in = context.getAssets().open("antalia/graph_manifest.json")) {
             java.io.ByteArrayOutputStream bytes = new java.io.ByteArrayOutputStream();
             byte[] buf = new byte[4096]; int n;
             while ((n = in.read(buf)) != -1) bytes.write(buf, 0, n);
             manifest = bytes.toString("UTF-8");
         }
-        JSONObject stages = new JSONObject(manifest).getJSONObject("stage_tests");
-        for (String name : models) {
-            String filename = name + ".onnx";
-            String expected = stages.getJSONObject(name).getString("sha256");
+        JSONObject stages = new JSONObject(manifest).getJSONObject("sha256");
+        for (String filename : models) {
+            String expected = stages.getString(filename);
             File dest = new File(dir, filename);
             if (!dest.isFile() || !expected.equals(sha256(dest))) {
                 File temp = new File(dir, filename + ".part");
@@ -122,55 +123,43 @@ final class AntaliaCore implements AutoCloseable {
     }
 
     private void closeSessions() {
-        closeSession(sound); closeSession(decoder); closeSession(text);
-        sound = decoder = text = null;
+        closeSession(vocoder); closeSession(flow); closeSession(conditioning); closeSession(text);
+        vocoder = flow = conditioning = text = null;
         if (options != null) try { options.close(); } catch (Exception ignored) {}
         options = null;
         currentThreads = -1;
-        currentSteps = -1;
     }
 
     private void open(int steps, int threads) throws Exception {
-        if (steps != 4 && steps != 8) throw new IllegalArgumentException("Steps must be 4 or 8");
+        if (steps != 4 && steps != 8) throw new IllegalArgumentException("Flow steps must be 4 or 8");
         if (threads != 1 && threads != 2 && threads != 4) throw new IllegalArgumentException("Threads must be 1, 2 or 4");
         install();
-        // Critical cold-start fix: do not initialize both flow graphs.
-        // Reuse common text/vocoder sessions when switching 4/8 steps.
-        if (currentThreads != threads || text == null || decoder == null) {
+        // The *same* flow graph is reused for 4 and 8 steps. Do not reload sessions
+        // when switching fast mode, only when intra-op thread count changes.
+        if (currentThreads == threads && text != null && flow != null) return;
+        closeSessions();
+        options = new OrtSession.SessionOptions();
+        options.setIntraOpNumThreads(threads);
+        options.setInterOpNumThreads(1);
+        options.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT);
+        try {
+            text = env.createSession(new File(modelDir, "text.onnx").getAbsolutePath(), options);
+            conditioning = env.createSession(new File(modelDir, "cond.onnx").getAbsolutePath(), options);
+            flow = env.createSession(new File(modelDir, "flow.onnx").getAbsolutePath(), options);
+            vocoder = env.createSession(new File(modelDir, "vocoder.fp16.onnx").getAbsolutePath(), options);
+            currentThreads = threads;
+        } catch (Exception e) {
             closeSessions();
-            options = new OrtSession.SessionOptions();
-            options.setIntraOpNumThreads(threads);
-            options.setInterOpNumThreads(1);
-            options.setOptimizationLevel(OrtSession.SessionOptions.OptLevel.ALL_OPT);
-            try {
-                text = env.createSession(new File(modelDir, "text_stage.onnx").getAbsolutePath(), options);
-                decoder = env.createSession(new File(modelDir, "decoder.onnx").getAbsolutePath(), options);
-                currentThreads = threads;
-            } catch (Exception e) {
-                closeSessions();
-                throw e;
-            }
-        }
-        if (sound == null || currentSteps != steps) {
-            closeSession(sound);
-            sound = null;
-            currentSteps = -1;
-            try {
-                String name = steps == 4 ? "sound_stage_4.onnx" : "sound_stage.onnx";
-                sound = env.createSession(new File(modelDir, name).getAbsolutePath(), options);
-                currentSteps = steps;
-            } catch (Exception e) {
-                closeSessions();
-                throw e;
-            }
+            throw e;
         }
     }
 
-    /** Called on the background executor when app/service starts; no playback. */
     synchronized void prepare(int steps, int threads) throws Exception {
         open(steps, threads);
         normalizer.prepare();
     }
+
+    String lastProfile() { return lastProfile; }
 
     private long[] tokens(String normalized) throws Exception {
         long[] ids = new long[normalized.length() + 2];
@@ -232,79 +221,135 @@ final class AntaliaCore implements AutoCloseable {
     }
 
     private float[] infer(String part, int steps, float speed, int chunkIndex) throws Exception {
+        // This matches the original 1.0.1 four-stage split: text -> cond -> flow -> vocoder.
+        // The flow model is *one* Euler step and gets invoked 4 or 8 times.
+        final long startNanos = System.nanoTime();
         String prefix = (part.startsWith("ö") || part.startsWith("ı")) ? "ee, " : "";
         String suffix = " ee.";
         long[] ids = tokens(prefix + part + suffix);
         float[][] hidden;
         float[] logd;
-        byte[] mask = new byte[ids.length];
-        Arrays.fill(mask, (byte)1);
-        try (OnnxTensor idsTensor = OnnxTensor.createTensor(env, LongBuffer.wrap(ids), new long[]{1,ids.length});
-             OnnxTensor maskTensor = OnnxTensor.createTensor(env, ByteBuffer.wrap(mask), new long[]{1,ids.length}, OnnxJavaType.BOOL);
-             OrtSession.Result result = text.run(feed("ids",idsTensor,"mask",maskTensor))) {
+        try (OnnxTensor idsTensor = OnnxTensor.createTensor(env, LongBuffer.wrap(ids), new long[]{1, ids.length});
+             OrtSession.Result result = text.run(Collections.singletonMap("ids", idsTensor))) {
             hidden = ((float[][][])result.get("h").orElseThrow().getValue())[0];
             logd = ((float[][])result.get("logd").orElseThrow().getValue())[0];
         }
-        if (hidden.length != ids.length || logd.length != ids.length) throw new IllegalStateException("Text stage tensor shape mismatch");
-        for (int i=2;i<ids.length-1;i++) {
-            if (ids[i]==ids[i-1] && ids[i]!=3L) logd[i] += (float)Math.log(1.3);
-            else if (ids[i-1]==3L && ids[i]==ids[i-2]) logd[i-1] += (float)Math.log(1.3);
+        long afterText = System.nanoTime();
+        if (hidden.length != ids.length || logd.length != ids.length)
+            throw new IllegalStateException("Text model tensor shape mismatch");
+        for (int i = 2; i < ids.length - 1; i++) {
+            if (ids[i] == ids[i - 1] && ids[i] != 3L) logd[i] += (float)Math.log(1.3);
+            else if (ids[i - 1] == 3L && ids[i] == ids[i - 2]) logd[i - 1] += (float)Math.log(1.3);
         }
-        int[] duration = new int[ids.length]; int frames=0;
-        for (int i=0;i<duration.length;i++) {
-            if (!Float.isFinite(logd[i])) throw new IllegalStateException("Non-finite duration");
-            int n=(int)Math.round(Math.exp(logd[i])/speed);
-            duration[i]=Math.max(1,Math.min(60,n));
-            frames+=duration[i];
+
+        int[] durations = new int[ids.length];
+        int frames = 0;
+        for (int i = 0; i < durations.length; i++) {
+            if (!Float.isFinite(logd[i])) throw new IllegalStateException("Non-finite token duration");
+            int duration = (int)Math.rint(Math.exp(logd[i]) / speed);  // round-half-to-even
+            durations[i] = Math.max(1, Math.min(60, duration));
+            frames += durations[i];
         }
-        frames = ((frames+STACK-1)/STACK)*STACK;
-        if (frames < 2 || frames > 16000) throw new IllegalStateException("Too many predicted audio frames: "+frames);
-        float[] cond = new float[frames*HIDDEN];int frame=0;
-        for(int i=0;i<duration.length;i++) {
-            if(hidden[i].length != HIDDEN) throw new IllegalStateException("Hidden dimension mismatch");
-            for(int j=0;j<duration[i];j++) {
-                System.arraycopy(hidden[i],0,cond,frame*HIDDEN,HIDDEN);frame++;
+        frames = ((frames + STACK - 1) / STACK) * STACK;
+        if (frames < 2 || frames > 16000) throw new IllegalStateException("Invalid duration frames: " + frames);
+        final int halfFrames = frames / STACK;
+        long[] index = new long[frames];
+        int pos = 0;
+        for (int i = 0; i < ids.length; i++) {
+            for (int j = 0; j < durations[i]; j++) index[pos++] = i;
+        }
+        while (pos < frames) index[pos++] = ids.length - 1;
+        float[] flattenedHidden = new float[ids.length * HIDDEN];
+        for (int i = 0; i < ids.length; i++) {
+            if (hidden[i].length != HIDDEN) throw new IllegalStateException("Invalid text hidden size");
+            System.arraycopy(hidden[i], 0, flattenedHidden, i * HIDDEN, HIDDEN);
+        }
+
+        float[][] ctok;
+        float[][] cnull;
+        try (OnnxTensor h = OnnxTensor.createTensor(env, FloatBuffer.wrap(flattenedHidden),
+                                      new long[]{1, ids.length, HIDDEN});
+             OnnxTensor idx = OnnxTensor.createTensor(env, LongBuffer.wrap(index),
+                                        new long[]{1, frames});
+             OrtSession.Result result = conditioning.run(feed("h", h, "idx", idx))) {
+            ctok = ((float[][][])result.get("ctok").orElseThrow().getValue())[0];
+            cnull = ((float[][][])result.get("cnull").orElseThrow().getValue())[0];
+        }
+        long afterCond = System.nanoTime();
+        if (ctok.length != halfFrames || cnull.length != halfFrames)
+            throw new IllegalStateException("Conditioning frame mismatch");
+        float[] conditioned = new float[halfFrames * HIDDEN];
+        float[] unconditioned = new float[halfFrames * HIDDEN];
+        for (int i = 0; i < halfFrames; i++) {
+            if (ctok[i].length != HIDDEN || cnull[i].length != HIDDEN)
+                throw new IllegalStateException("Conditioning hidden mismatch");
+            System.arraycopy(ctok[i], 0, conditioned, i * HIDDEN, HIDDEN);
+            System.arraycopy(cnull[i], 0, unconditioned, i * HIDDEN, HIDDEN);
+        }
+
+        // Keep a single seeded Gaussian noise sample across the entire Euler loop.
+        float[] noise = new float[halfFrames * BINS * STACK];
+        Random rng = new Random(0xA77A1AL + chunkIndex);
+        for (int i = 0; i < noise.length; i++) noise[i] = (float)(rng.nextGaussian() * 0.6);
+        float dtv = 1.0f / steps;
+        try (OnnxTensor ctx = OnnxTensor.createTensor(env, FloatBuffer.wrap(conditioned),
+                                            new long[]{1, halfFrames, HIDDEN});
+             OnnxTensor nul = OnnxTensor.createTensor(env, FloatBuffer.wrap(unconditioned),
+                                            new long[]{1, halfFrames, HIDDEN});
+             OnnxTensor dt = OnnxTensor.createTensor(env, FloatBuffer.wrap(new float[]{dtv}),
+                                            new long[]{1});
+             OnnxTensor cfg = OnnxTensor.createTensor(env, FloatBuffer.wrap(new float[]{2.0f}),
+                                             new long[]{1})) {
+            for (int step = 0; step < steps; step++) {
+                try (OnnxTensor x = OnnxTensor.createTensor(env, FloatBuffer.wrap(noise),
+                                                 new long[]{1, halfFrames, BINS * STACK});
+                     OnnxTensor t = OnnxTensor.createTensor(env, FloatBuffer.wrap(new float[]{step * dtv}),
+                                                 new long[]{1});
+                     OrtSession.Result result = flow.run(feed("x", x, "ctok", ctx, "cnull", nul,
+                                                              "t", t, "dt", dt, "cfg", cfg))) {
+                    float[][] next = ((float[][][])result.get("x_next").orElseThrow().getValue())[0];
+                    if (next.length != halfFrames) throw new IllegalStateException("Flow frame mismatch");
+                    for (int i = 0; i < halfFrames; i++) {
+                        if (next[i].length != BINS * STACK) throw new IllegalStateException("Flow dimension mismatch");
+                        System.arraycopy(next[i], 0, noise, i * BINS * STACK, BINS * STACK);
+                    }
+                }
             }
         }
-        while(frame<frames) {
-            System.arraycopy(hidden[ids.length-1],0,cond,frame*HIDDEN,HIDDEN);frame++;
-        }
-        byte[] fmask=new byte[frames];Arrays.fill(fmask,(byte)1);
-        float[] noise=new float[(frames/STACK)*BINS*STACK];
-        Random random=new Random(0xA77A1A+chunkIndex);
-        for(int i=0;i<noise.length;i++)noise[i]=(float)(random.nextGaussian()*0.6);
-        float[][] mel;
-        try (OnnxTensor c = OnnxTensor.createTensor(env,FloatBuffer.wrap(cond),new long[]{1,frames,HIDDEN});
-             OnnxTensor m = OnnxTensor.createTensor(env,ByteBuffer.wrap(fmask),new long[]{1,frames},OnnxJavaType.BOOL);
-             OnnxTensor z = OnnxTensor.createTensor(env,FloatBuffer.wrap(noise),new long[]{1,frames/STACK,BINS*STACK});
-             OrtSession.Result out=sound.run(feed("cond",c,"fmask",m,"noise",z))) {
-            mel=((float[][][])out.get("mel").orElseThrow().getValue())[0];
-        }
-        if(mel.length!=BINS)throw new IllegalStateException("Mel dimension mismatch");
-        float[] flat=new float[BINS*frames];
-        for(int i=0;i<BINS;i++) {
-            if(mel[i].length!=frames)throw new IllegalStateException("Mel frame mismatch");
-            System.arraycopy(mel[i],0,flat,i*frames,frames);
-        }
+        long afterFlow = System.nanoTime();
+
         float[] audio;
-        try(OnnxTensor mt=OnnxTensor.createTensor(env,FloatBuffer.wrap(flat),new long[]{1,BINS,frames});
-            OrtSession.Result out=decoder.run(Collections.singletonMap("mel",mt))) {
-            audio=((float[][])out.get("audio").orElseThrow().getValue())[0];
+        long afterVocoder;
+        try (OnnxTensor z = OnnxTensor.createTensor(env, FloatBuffer.wrap(noise),
+                                            new long[]{1, halfFrames, BINS * STACK});
+             OrtSession.Result result = vocoder.run(Collections.singletonMap("z", z))) {
+            float[][] re = ((float[][][])result.get("re").orElseThrow().getValue())[0];
+            float[][] im = ((float[][][])result.get("im").orElseThrow().getValue())[0];
+            afterVocoder = System.nanoTime();
+            audio = AntaliaIstft.invert(re, im);
         }
-        int prefixCount=prefix.length();
-        int suffixCount=suffix.length();
-        int first=0,last=0;
-        for(int i=0;i<duration.length;i++) {
-            if (i<=prefixCount) first+=duration[i];
-            if (i<=ids.length-2-suffixCount) last+=duration[i];
+        long afterIstft = System.nanoTime();
+
+        int prefixCount = prefix.length();
+        int suffixCount = suffix.length();
+        int first = 0, last = 0;
+        for (int i = 0; i < durations.length; i++) {
+            if (i <= prefixCount) first += durations[i];
+            if (i <= ids.length - 2 - suffixCount) last += durations[i];
         }
-        int from=prefixCount>0 ? Math.max(0,first*HOP):0;
-        int to=Math.min(audio.length,last*HOP);
-        if(to<=from)throw new IllegalStateException("Invalid PCM crop");
-        float[] clipped=Arrays.copyOfRange(audio,from,to);
-        int fade=Math.min(240,clipped.length/2);
-        if(prefixCount>0)for(int i=0;i<fade;i++)clipped[i]*=i/(float)fade;
-        for(int i=0;i<fade;i++)clipped[clipped.length-1-i]*=i/(float)fade;
+        int from = prefixCount > 0 ? Math.max(0, first * HOP) : 0;
+        int to = Math.min(audio.length, last * HOP);
+        if (to <= from) throw new IllegalStateException("Invalid PCM crop");
+        float[] clipped = Arrays.copyOfRange(audio, from, to);
+        int fade = Math.min(240, clipped.length / 2);
+        if (prefixCount > 0) for (int i = 0; i < fade; i++) clipped[i] *= i / (float)fade;
+        for (int i = 0; i < fade; i++) clipped[clipped.length - 1 - i] *= i / (float)fade;
+
+        lastProfile = String.format(java.util.Locale.ROOT,
+            "text %.0fms · cond %.0fms · flow %.0fms · vocoder %.0fms · iSTFT %.0fms",
+            (afterText - startNanos) / 1e6, (afterCond - afterText) / 1e6,
+            (afterFlow - afterCond) / 1e6, (afterVocoder - afterFlow) / 1e6,
+            (afterIstft - afterVocoder) / 1e6);
         return clipped;
     }
 

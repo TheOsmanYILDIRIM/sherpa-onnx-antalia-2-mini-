@@ -1,12 +1,27 @@
-# Antalia-2 Mini Android (Sherpa-ONNX fork)
+# Antalia-2 Mini Android — original split ONNX graph path
 
-Experimental compact Android TTS app directly in the Sherpa-ONNX fork, no HayaiTTS checkout. Inference is performed through the ONNX Runtime Java SDK; native Sherpa-ONNX C++ model integration is not claimed.
+This experimental Android system TTS app lives in the Sherpa-ONNX fork and does not fetch HayaiTTS. Audio inference uses ONNX Runtime Java rather than a native Sherpa C++ model handler.
 
-Controls: 4/8 genuine flow steps, 1/2/4 intra-op threads, four-configuration latency benchmark with time-to-first PCM, Android Turkish TTS service and limited wake-lock usage.
+## Why this revision
+The original APK provided for comparison uses four ONNX graph roles:
 
-Weights are per-channel INT8 QDQ with sensitive vocoder blocks in FP32. Official 1.0.1 model revision and text normalization sources are pinned. Numeric parity testing and CI do not constitute Android device or listening tests. Screen-off behavior and official de-esser parity remain unverified.
+1. text.onnx (FP32): input character IDs -> 192-dimensional features + durations.
+2. cond.onnx (FP32): duration expansion indices -> conditioned/null representations.
+3. flow.onnx (FP32): one CFG2 Euler step; reuse the graph 4 or 8 times.
+4. vocoder.fp16.onnx (mixed precision): latent -> complex STFT re/im.
+5. Java 2048-point FFT / hop 512 Hann overlap-add iSTFT -> 48 kHz samples.
 
-Uses only Android arm64-v8a ONNX Runtime, Java platform UI without Compose, R8 shrinking, compressed model assets (expanded into app-private files at first run). The goal is to minimize APK size; 35 MB is not guaranteed. Experimental APKs use debug signing only.
+The previous text_stage / sound_stage_{4,8} / decoder design was significantly slower on the user's phone. The original graph assets are pinned to a Hugging Face Space revision and validated against exact SHA-256 hashes extracted from the user-provided original 0.1.1 APK. Any mismatch fails CI.
 
-## First-audio latency optimization
-The Android app and system TTS service now share a process-wide ONNX core; the UI prepares the selected 4- or 8-step session and normalizer in a background worker on launch. Only the selected sound graph is opened, the common encoder/vocoder sessions stay resident across step changes, and the Turkish WebView normalizer and dictionaries are initialized once. A thread-count change still requires rebuilding ONNX sessions. A physical device performance comparison is pending.
+## Controls and performance
+- 4 / 8 actual Euler steps (no duplicate sound-stage graph).
+- 1 / 2 / 4 CPU intra-op threads.
+- Benchmark timing and per-stage text / cond / flow / vocoder / iSTFT instrumentation.
+- Background preload of reusable ONNX sessions and persistent WebView normalizer.
+- Turkish Android TextToSpeechService, PCM16 chunks, PARTIAL_WAKE_LOCK during synthesis.
+- Single ARM64 debug APK, minification and compressed native library packaging.
+
+## Remaining differences
+The JavaScript normalize.js frontend and its four dictionary assets remain in use, rather than the original APK's AWT1 words.bin and compiled normalizer. The 47-character tokenizer is compatible, but some unusual text normalizations may differ. The current post-EQ/soft-limiter follows the web converter's output chain, not proven identical to the original APK's de-esser and full curve. Gaussian seed generation also differs from Python/Torch's exact PRNG. No Android device speedup, playback parity, or listening quality claim until a new physical phone test.
+
+Source model: cloud0day3/antalia-mini 1.0.1 (Apache-2.0). Split graph origin: cloud0day3/antalia-mini Hugging Face Space revision 2c24b406fedada11bd731a2ec9f4535bfd354f03. JNI/runtime ONNX Runtime 1.21.0. Main branch and signing keys are unchanged.
