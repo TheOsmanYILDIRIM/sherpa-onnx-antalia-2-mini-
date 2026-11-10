@@ -90,6 +90,31 @@ jobs:
           assert content.count('web.settings.javaScriptEnabled = true') == 1
           PY
 
+      - name: Configure ARM64-only APK (do not modify HayaiTTS repository)
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          path = Path("hayai-android/app/build.gradle.kts")
+          content = path.read_text(encoding="utf-8")
+          changes = {
+              'abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")':
+                  'abiFilters += listOf("arm64-v8a")',
+              'include("arm64-v8a", "armeabi-v7a", "x86_64")':
+                  'include("arm64-v8a")',
+              'isUniversalApk = true':
+                  'isUniversalApk = false',
+          }
+          for old, new in changes.items():
+              assert content.count(old) == 1, f"Unexpected Gradle ABI config: {old}"
+              content = content.replace(old, new, 1)
+          path.write_text(content, encoding="utf-8")
+          for new in changes.values():
+              assert content.count(new) == 1
+          print("Only arm64-v8a enabled; universal and other ABIs disabled")
+          PY
+
       - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
@@ -125,11 +150,42 @@ jobs:
           chmod +x gradlew
           ./gradlew :app:testDebugUnitTest :app:assembleDebug --stacktrace --no-daemon
 
-      - name: Upload experimental APK
+      - name: Verify exactly one ARM64 APK and model assets
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib
+          from pathlib import Path
+          from zipfile import ZipFile
+
+          output_dir = Path('hayai-android/app/build/outputs/apk/debug')
+          apks = sorted(output_dir.glob('*.apk'))
+          assert len(apks) == 1, f"Expected exactly one APK, got: {[p.name for p in apks]}"
+          apk = apks[0]
+          assert apk.name == 'app-arm64-v8a-debug.apk', apk.name
+          with ZipFile(apk) as archive:
+              assert archive.testzip() is None, "APK archive integrity failed"
+              names = archive.namelist()
+              architectures = sorted({
+                  name.split('/')[1] for name in names
+                  if name.startswith('lib/') and len(name.split('/')) > 2
+              })
+              assert architectures == ['arm64-v8a'], architectures
+              for name in ('text_stage.onnx', 'sound_stage.onnx', 'decoder.onnx',
+                           'normalize.js', 'config.json', 'vocab.json'):
+                  path = 'assets/antalia/' + name
+                  assert path in names, f"Missing Antalia asset: {path}"
+          sha = hashlib.sha256(apk.read_bytes()).hexdigest()
+          print(f'Validated single ARM64 APK: {apk} ({apk.stat().st_size} bytes)')
+          print(f'SHA-256: {sha}')
+          PY
+
+      - name: Upload ARM64-only experimental APK
         if: success()
         uses: actions/upload-artifact@v4
         with:
-          name: antalia-2-mini-1.0.1-android-experimental
-          path: hayai-android/app/build/outputs/apk/debug/*.apk
+          name: antalia-2-mini-1.0.1-android-arm64-v8a
+          path: hayai-android/app/build/outputs/apk/debug/app-arm64-v8a-debug.apk
           if-no-files-found: error
           retention-days: 14
