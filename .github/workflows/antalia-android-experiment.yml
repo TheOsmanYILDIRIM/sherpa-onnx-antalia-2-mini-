@@ -289,6 +289,8 @@ jobs:
               so=[n for n in names if n.endswith('.so')]
               assert any('libonnxruntime.so' in n for n in so),so
               assert not any('sherpa' in n.lower() or 'hayai' in n.lower() for n in names)
+              libs=[n for n in names if n.startswith('lib/') and n.endswith('.so')]
+              assert libs and all(z.getinfo(n).compress_type==8 for n in libs), 'Native libraries not compressed in APK'
               for f in ('text_stage.onnx','sound_stage.onnx','sound_stage_4.onnx',
                         'decoder.onnx','normalize.js','vocab.json','quantization.json'):
                   assert 'assets/antalia/'+f in names,f
@@ -296,6 +298,7 @@ jobs:
               assert info['version']=='1.0.1'
               assert set(info['stage_tests'])=={'text_stage','sound_stage','sound_stage_4','decoder'}
               print('ONNX sizes:',info['model_sizes_before_bytes'],info['model_sizes_after_bytes'])
+          assert p.stat().st_size < 35000000, f'APK exceeds 35 MB: {p.stat().st_size} bytes'
           print('Validated single-arm64 APK',p,'size',p.stat().st_size,
                 'SHA256',hashlib.sha256(p.read_bytes()).hexdigest())
           PY

@@ -31,7 +31,8 @@ android {
     }
     packaging {
         resources { excludes += ['/META-INF/{AL2.0,LGPL2.1}', '/META-INF/DEPENDENCIES'] }
-        jniLibs { useLegacyPackaging = false }
+        // Compress the 19 MB ONNX Runtime library in the APK; Android extracts it on install.
+        jniLibs { useLegacyPackaging = true }
     }
 }
 dependencies {
