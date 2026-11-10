@@ -10,7 +10,7 @@ import json
 import shutil
 import sys
 from pathlib import Path
-from urllib.request import urlopen
+from zipfile import ZipFile
 import numpy as np
 import onnxruntime as ort
 from huggingface_hub import hf_hub_download
@@ -32,7 +32,7 @@ NORMALIZER_ASSETS = (
 def sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
-def prepare(source: Path, dest: Path) -> None:
+def prepare(source: Path, dest: Path, previous_apk: Path) -> None:
     meta_path = source / 'provenance.json'
     meta = json.loads(meta_path.read_text(encoding='utf-8'))
     assert meta['version'] == '1.0.1'
@@ -49,11 +49,19 @@ def prepare(source: Path, dest: Path) -> None:
         path = source / name
         assert path.is_file() and sha256(path) == meta['sha256'][name], name
         shutil.copyfile(path, dest / name)
-    normalizer_url = ('https://raw.githubusercontent.com/fr0stb1rd/antalia-mini-web/'
-                      + NORMALIZER_REV + '/normalize.js')
-    with urlopen(normalizer_url, timeout=45) as response:
-        js = response.read()
-    assert b'AntaliaText' in js and len(js) > 20000
+    # The pinned upstream normalize.js URL became unavailable (HTTP 404).
+    # Reuse only the already-verified prior successful CI APK; no network fallback.
+    with ZipFile(previous_apk) as z:
+        assert z.testzip() is None, 'Previous APK corrupted'
+        old_manifest = json.loads(z.read('assets/antalia/graph_manifest.json'))
+        assert old_manifest['model_version'] == '1.0.1'
+        assert old_manifest['normalizer_commit'] == NORMALIZER_REV
+        assert old_manifest['sha256'] == EXPECTED, 'Source model mismatch'
+        js = z.read('assets/antalia/normalize.js')
+        digest = hashlib.sha256(js).hexdigest()
+        assert digest == old_manifest['normalizer_sha256'], 'Normalizer checksum mismatch'
+        assert b'AntaliaText' in js and len(js) > 20000
+        print('Reused verified original normalize.js', len(js), digest)
     (dest / 'normalize.js').write_bytes(js)
     manifest = {
         'model': 'Antalia-2 Mini', 'model_version': '1.0.1',
@@ -103,5 +111,5 @@ def verify_graphs(dest: Path) -> None:
     print('Verified split ONNX graph interfaces and four Euler steps.')
 
 if __name__ == '__main__':
-    assert len(sys.argv) == 3, 'usage: prepare_models.py SRC_ARTIFACT DEST_ANDROID_ASSETS'
-    prepare(Path(sys.argv[1]), Path(sys.argv[2]))
+    assert len(sys.argv) == 4, 'usage: prepare_models.py SRC_ARTIFACT DEST_ANDROID_ASSETS PREVIOUS_APK'
+    prepare(Path(sys.argv[1]), Path(sys.argv[2]), Path(sys.argv[3]))

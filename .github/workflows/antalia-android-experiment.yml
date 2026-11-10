@@ -30,6 +30,15 @@ jobs:
           github-token: ${{ github.token }}
           path: ${{ runner.temp }}/antalia-onnx
 
+      - name: Download last verified background TTS APK for pinned normalizer
+        uses: actions/download-artifact@v4
+        with:
+          name: antalia-mini-1.0.1-sherpa-fork-arm64-original-split
+          repository: TheOsmanYILDIRIM/sherpa-onnx-antalia-2-mini-
+          run-id: 42824178440
+          github-token: ${{ github.token }}
+          path: ${{ runner.temp }}/antalia-last-good
+
       - name: Fetch and validate original four split ONNX graphs
         shell: bash
         run: |
@@ -38,7 +47,8 @@ jobs:
             'huggingface_hub==0.30.2' 'onnxruntime==1.21.0' 'numpy==1.26.4'
           python3 android/AntaliaMiniTts/prepare_models.py \
             "${{ runner.temp }}/antalia-onnx" \
-            "android/AntaliaMiniTts/app/src/main/assets/antalia"
+            "android/AntaliaMiniTts/app/src/main/assets/antalia" \
+            "${{ runner.temp }}/antalia-last-good/app-debug.apk"
 
       - name: Set up JDK 21
         uses: actions/setup-java@v4
