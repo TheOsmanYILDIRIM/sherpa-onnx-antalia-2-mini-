@@ -1,4 +1,4 @@
-name: Antalia-2 Mini 1.0.1 Android TTS experiment
+name: Antalia 1.0.1 - direct Sherpa fork Android ARM64 compact TTS
 
 on:
   push:
@@ -6,6 +6,7 @@ on:
       - experiment/antalia-android-1.0.1-20261110
     paths:
       - .github/workflows/antalia-android-experiment.yml
+      - android/AntaliaMiniTts/**
   workflow_dispatch:
 
 permissions:
@@ -17,18 +18,10 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 90
     steps:
-      - name: Checkout Sherpa-ONNX fork
+      - name: Checkout Sherpa-ONNX fork directly (no HayaiTTS)
         uses: actions/checkout@v4
 
-      - name: Checkout existing Antalia Android integration (pinned)
-        uses: actions/checkout@v4
-        with:
-          repository: TheOsmanYILDIRIM/HayaiTTS
-          ref: 74f8cd4534a55d570ce3b2dbfe962e698421205d
-          path: hayai-android
-          lfs: true
-
-      - name: Download verified 1.0.1 model from our successful conversion
+      - name: Download verified Antalia 1.0.1 eight-step model
         uses: actions/download-artifact@v4
         with:
           name: antalia-2-mini-1.0.1-fp32-onnx
@@ -37,57 +30,84 @@ jobs:
           github-token: ${{ github.token }}
           path: ${{ runner.temp }}/antalia-onnx
 
-      - name: Install and verify Antalia model and original normalizer
+      - name: Verify pinned model and prepare minimal Android assets
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import hashlib
-          import json
-          import pathlib
-          import shutil
-
-          source = pathlib.Path('${{ runner.temp }}/antalia-onnx')
-          target = pathlib.Path('hayai-android/app/src/main/assets/antalia')
-          meta = json.loads((source / 'provenance.json').read_text(encoding='utf-8'))
-          assert meta['version'] == '1.0.1'
-          assert meta['model_revision'] == '0965f4a5fb578763be8ca2a2bb39421378471cd1'
-          assert meta['flow_steps'] == 8 and meta['cfg'] == 2.0
-          required = (
-              'text_stage.onnx', 'sound_stage.onnx', 'decoder.onnx',
-              'foreign_dict.json', 'foreign_parts.json', 'known_words.json', 'english_i.json',
-              'config.json', 'vocab.json', 'LICENSE', 'NOTICE',
-          )
-          target.mkdir(parents=True, exist_ok=True)
-          for name in required:
-              item = source / name
-              assert item.is_file() and item.stat().st_size > 0, name
-              expected_sha = meta['sha256'][name]
-              actual_sha = hashlib.sha256(item.read_bytes()).hexdigest()
-              assert actual_sha == expected_sha, name
-              shutil.copy2(item, target / name)
-          cfg = json.loads((target / 'config.json').read_text(encoding='utf-8'))
-          assert cfg['version'] == '1.0.1'
-          assert cfg['sample_rate'] == 48000
-          print('Pinned FP32 model and dictionary SHA-256 verified')
+          import json, hashlib, shutil
+          from pathlib import Path
+          source=Path('${{ runner.temp }}/antalia-onnx')
+          dest=Path('android/AntaliaMiniTts/app/src/main/assets/antalia')
+          dest.mkdir(parents=True,exist_ok=True)
+          meta=json.loads((source/'provenance.json').read_text(encoding='utf-8'))
+          assert meta['version']=='1.0.1'
+          assert meta['model_revision']=='0965f4a5fb578763be8ca2a2bb39421378471cd1'
+          assert meta['flow_steps']==8 and float(meta['cfg'])==2.0
+          for file in ('text_stage.onnx','sound_stage.onnx','decoder.onnx',
+                       'vocab.json','config.json','foreign_dict.json',
+                       'foreign_parts.json','known_words.json','english_i.json',
+                       'LICENSE','NOTICE'):
+              obj=source/file
+              assert obj.is_file() and obj.stat().st_size>0,file
+              assert hashlib.sha256(obj.read_bytes()).hexdigest()==meta['sha256'][file],file
+              shutil.copy2(obj,dest/file)
+          print('Pinned 1.0.1 model SHA-256 verified')
           PY
           curl --fail --location --silent --show-error \
-            --output hayai-android/app/src/main/assets/antalia/normalize.js \
+            --output android/AntaliaMiniTts/app/src/main/assets/antalia/normalize.js \
             https://raw.githubusercontent.com/fr0stb1rd/antalia-mini-web/459585b3bf67db5db5d9ec03d394d9b2c95412f2/normalize.js
 
-      - name: Repair prototype Android WebView normalizer
+      - name: Install 4-step exporter dependencies and pin source
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --upgrade pip
+          python3 -m pip install --index-url https://download.pytorch.org/whl/cpu 'torch==2.6.0'
+          python3 -m pip install 'numpy==1.26.4' 'onnx==1.17.0' 'onnxruntime==1.21.0' \
+            'onnxscript==0.2.6' 'safetensors==0.5.3' 'huggingface_hub==0.30.2' 'cmudict==1.0.32'
+          git clone --filter=blob:none https://github.com/fr0stb1rd/antalia-mini-web.git "${{ runner.temp }}/antalia-converter"
+          git -C "${{ runner.temp }}/antalia-converter" checkout --detach 459585b3bf67db5db5d9ec03d394d9b2c95412f2
+          test "$(git -C "${{ runner.temp }}/antalia-converter" hash-object export_onnx.py)" = 12062c8e57bfefa70e7b73d959e2e50926878f82
+          python3 - <<'PY'
+          from pathlib import Path
+          file=Path('${{ runner.temp }}/antalia-converter/export_onnx.py')
+          src=file.read_text(encoding='utf-8')
+          old='hf_hub_download(repo, fname, local_dir=str(cache_dir))'
+          new="hf_hub_download(repo, fname, revision='0965f4a5fb578763be8ca2a2bb39421378471cd1', local_dir=str(cache_dir))"
+          assert src.count(old)==1
+          file.write_text(src.replace(old,new),encoding='utf-8')
+          PY
+
+      - name: Export and PyTorch-check true four-step CFG2 sound graph
+        shell: bash
+        working-directory: ${{ runner.temp }}/antalia-converter
+        env:
+          ANTALIA_MODEL_REPO: cloud0day3/antalia-mini
+          OMP_NUM_THREADS: '2'
+          MKL_NUM_THREADS: '2'
+        run: |
+          set -euo pipefail
+          python3 export_onnx.py --check --steps 4 --cfg 2.0
+
+      - name: Add independently exported four-step graph and pinned hash
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
+          import hashlib, json, shutil
           from pathlib import Path
-          path = Path('hayai-android/app/src/main/java/dev/ahmedmohamed/hayaitts/data/antalia/AntaliaWebNormalizer.kt')
-          content = path.read_text(encoding='utf-8')
-          anchor = 'val web = WebView(context.applicationContext)'
-          assert content.count(anchor) == 1, 'Unexpected normalizer implementation'
-          content = content.replace(anchor, anchor + '\n            web.settings.javaScriptEnabled = true')
-          path.write_text(content, encoding='utf-8')
-          assert content.count('web.settings.javaScriptEnabled = true') == 1
+          src=Path('${{ runner.temp }}/antalia-converter/models/sound_stage.onnx')
+          dst=Path('${{ runner.temp }}/antalia-onnx/sound_stage_4.onnx')
+          assert src.is_file() and src.stat().st_size>100000
+          shutil.copy2(src,dst)
+          meta_path=Path('${{ runner.temp }}/antalia-onnx/provenance.json')
+          meta=json.loads(meta_path.read_text(encoding='utf-8'))
+          meta['sha256']['sound_stage_4.onnx']=hashlib.sha256(dst.read_bytes()).hexdigest()
+          meta['four_step_exporter_commit']='459585b3bf67db5db5d9ec03d394d9b2c95412f2'
+          meta['four_step_validation']='PyTorch parity via export_onnx.py --check --steps 4 --cfg 2.0'
+          meta_path.write_text(json.dumps(meta,indent=2),encoding='utf-8')
+          print('Verified genuine four-step sound_stage_4.onnx')
           PY
 
       - name: Quantize 1.0.1 ONNX weights to per-channel INT8 and verify parity
@@ -105,10 +125,10 @@ jobs:
           from onnx import TensorProto, helper, numpy_helper
 
           source = Path('${{ runner.temp }}/antalia-onnx')
-          target = Path('hayai-android/app/src/main/assets/antalia')
+          target = Path('android/AntaliaMiniTts/app/src/main/assets/antalia')
           metadata = json.loads((source / 'provenance.json').read_text())
           assert metadata['version'] == '1.0.1'
-          stages = ('text_stage', 'sound_stage', 'decoder')
+          stages = ('text_stage', 'sound_stage', 'sound_stage_4', 'decoder')
           sessions = {}
           summary = {}
           def convert(src, dst):
@@ -186,8 +206,10 @@ jobs:
                   'noise': rng.normal(0,.6,(1,32,256)).astype('float32'),
               },
           }
+          data['sound_stage_4'] = data['sound_stage']
+          data['sound_stage_4'] = data['sound_stage']
           data['decoder'] = {'mel': sessions['sound_stage'][0].run(None,data['sound_stage'])[0]}
-          thresholds = {'text_stage': 28., 'sound_stage': 22., 'decoder': 25.}
+          thresholds = {'text_stage': 28., 'sound_stage': 22., 'sound_stage_4': 22., 'decoder': 25.}
           for stage in stages:
               expected = sessions[stage][0].run(None,data[stage])
               actual = sessions[stage][1].run(None,data[stage])
@@ -219,106 +241,69 @@ jobs:
           print('INT8 weight conversion verified:',before,'->',after)
           PY
 
-      - name: Configure ARM64-only APK (do not modify HayaiTTS repository)
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 - <<'PY'
-          from pathlib import Path
-          path = Path("hayai-android/app/build.gradle.kts")
-          content = path.read_text(encoding="utf-8")
-          changes = {
-              # ABI splits already filter native libraries. A second ndk abiFilter
-              # conflicts with Android Gradle Plugin when both select arm64-v8a.
-              chr(10).join(("        ndk {", '            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")', "        }", "")):
-                  '',
-              'include("arm64-v8a", "armeabi-v7a", "x86_64")':
-                  'include("arm64-v8a")',
-              'isUniversalApk = true':
-                  'isUniversalApk = false',
-          }
-          for old, new in changes.items():
-              assert content.count(old) == 1, f"Unexpected Gradle ABI config: {old}"
-              content = content.replace(old, new, 1)
-          path.write_text(content, encoding="utf-8")
-          for new in changes.values():
-              if new:
-                  assert content.count(new) == 1
-          assert "abiFilters +=" not in content, "Overlapping ndk ABI filter remains"
-          print("Only arm64-v8a ABI split enabled; removed conflicting ndk filter")
-          PY
-
       - name: Set up JDK 21
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '21'
 
-      - name: Install Android 36 with SDK manager from SDK home
+      - name: Install Android 35
         shell: bash
         run: |
           set -euo pipefail
-          SDK_ROOT="${ANDROID_HOME:-${ANDROID_SDK_ROOT:-/usr/local/lib/android/sdk}}"
-          echo "ANDROID_HOME=$SDK_ROOT" >> "$GITHUB_ENV"
-          echo "ANDROID_SDK_ROOT=$SDK_ROOT" >> "$GITHUB_ENV"
+          SDK_ROOT="$ANDROID_HOME"
           sdkmanager="$SDK_ROOT/cmdline-tools/latest/bin/sdkmanager"
           if [[ ! -x "$sdkmanager" ]]; then
             sdkmanager="$(find "$SDK_ROOT/cmdline-tools" -type f -name sdkmanager -print -quit)"
           fi
-          if [[ ! -x "$sdkmanager" ]]; then
-            echo "::error::No Android SDK command-line tools at $SDK_ROOT"
-            exit 1
-          fi
-          echo "Found sdkmanager at $sdkmanager"
-          "$sdkmanager" --sdk_root="$SDK_ROOT" --install "platforms;android-36" "build-tools;36.0.0"
+          test -x "$sdkmanager"
+          "$sdkmanager" --sdk_root="$SDK_ROOT" --install "platforms;android-35" "build-tools;35.0.0"
 
-      - name: Configure Gradle
+      - name: Set up Gradle 8.7
         uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
 
-      - name: Run Android unit tests and build debug APK
-        working-directory: hayai-android
+      - name: Build and test compact ARM64 debug APK
         shell: bash
         run: |
           set -euo pipefail
-          chmod +x gradlew
-          ./gradlew :app:testDebugUnitTest :app:assembleDebug --stacktrace --no-daemon
+          gradle -p android/AntaliaMiniTts :app:assembleDebug --stacktrace --no-daemon
 
-      - name: Verify exactly one ARM64 APK and model assets
+      - name: Assert exactly one ARM64 APK, real 4/8 models and no Hayai or Sherpa duplicate
         shell: bash
         run: |
           set -euo pipefail
           python3 - <<'PY'
-          import hashlib
-          from pathlib import Path
+          import json,hashlib
           from zipfile import ZipFile
-
-          output_dir = Path('hayai-android/app/build/outputs/apk/debug')
-          apks = sorted(output_dir.glob('*.apk'))
-          assert len(apks) == 1, f"Expected exactly one APK, got: {[p.name for p in apks]}"
-          apk = apks[0]
-          assert apk.name == 'app-arm64-v8a-debug.apk', apk.name
-          with ZipFile(apk) as archive:
-              assert archive.testzip() is None, "APK archive integrity failed"
-              names = archive.namelist()
-              architectures = sorted({
-                  name.split('/')[1] for name in names
-                  if name.startswith('lib/') and len(name.split('/')) > 2
-              })
-              assert architectures == ['arm64-v8a'], architectures
-              for name in ('text_stage.onnx', 'sound_stage.onnx', 'decoder.onnx',
-                           'normalize.js', 'config.json', 'vocab.json', 'quantization.json'):
-                  path = 'assets/antalia/' + name
-                  assert path in names, f"Missing Antalia asset: {path}"
-          sha = hashlib.sha256(apk.read_bytes()).hexdigest()
-          print(f'Validated single ARM64 APK: {apk} ({apk.stat().st_size} bytes)')
-          print(f'SHA-256: {sha}')
+          from pathlib import Path
+          apks=list(Path('android/AntaliaMiniTts/app/build/outputs/apk/debug').glob('*.apk'))
+          assert len(apks)==1,apks
+          p=apks[0]
+          with ZipFile(p) as z:
+              assert z.testzip() is None
+              names=z.namelist()
+              abis={n.split('/')[1] for n in names if n.startswith('lib/') and len(n.split('/'))>2}
+              assert abis=={'arm64-v8a'},abis
+              so=[n for n in names if n.endswith('.so')]
+              assert any('libonnxruntime.so' in n for n in so),so
+              assert not any('sherpa' in n.lower() or 'hayai' in n.lower() for n in names)
+              for f in ('text_stage.onnx','sound_stage.onnx','sound_stage_4.onnx',
+                        'decoder.onnx','normalize.js','vocab.json','quantization.json'):
+                  assert 'assets/antalia/'+f in names,f
+              info=json.loads(z.read('assets/antalia/quantization.json'))
+              assert info['version']=='1.0.1'
+              assert set(info['stage_tests'])=={'text_stage','sound_stage','sound_stage_4','decoder'}
+              print('ONNX sizes:',info['model_sizes_before_bytes'],info['model_sizes_after_bytes'])
+          print('Validated single-arm64 APK',p,'size',p.stat().st_size,
+                'SHA256',hashlib.sha256(p.read_bytes()).hexdigest())
           PY
 
-      - name: Upload ARM64-only experimental APK
-        if: success()
+      - name: Upload only the compact ARM64 APK
         uses: actions/upload-artifact@v4
         with:
-          name: antalia-2-mini-1.0.1-android-arm64-int8
-          path: hayai-android/app/build/outputs/apk/debug/app-arm64-v8a-debug.apk
+          name: antalia-mini-1.0.1-sherpa-fork-arm64-compact
+          path: android/AntaliaMiniTts/app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 14
