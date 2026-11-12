@@ -7,8 +7,6 @@ import android.speech.tts.SynthesisRequest
 import android.speech.tts.TextToSpeech
 import android.speech.tts.TextToSpeechService
 import android.util.Log
-import java.util.concurrent.atomic.AtomicBoolean
-import java.util.concurrent.atomic.AtomicInteger
 
 /*
 https://developer.android.com/reference/java/util/Locale#getISO3Language()
@@ -57,8 +55,6 @@ Failed to get default language from engine com.k2fsa.sherpa.chapter5
 */
 
 class TtsService : TextToSpeechService() {
-    private val stopRequested = AtomicBoolean(false)
-
     override fun onCreate() {
         Log.i(TAG, "onCreate tts service")
         super.onCreate()
@@ -105,10 +101,7 @@ class TtsService : TextToSpeechService() {
         }
     }
 
-    override fun onStop() {
-        // Android may invoke this on another thread while synthesis is active.
-        stopRequested.set(true)
-    }
+    override fun onStop() {}
 
     override fun onSynthesizeText(request: SynthesisRequest?, callback: SynthesisCallback?) {
         if (request == null || callback == null) {
@@ -136,93 +129,52 @@ class TtsService : TextToSpeechService() {
             return
         }
         Log.i(TAG, "text: $text, engineSpeed: $engineSpeed")
-        val tts = TtsEngine.tts ?: run {
-            Log.e(TAG, "TTS engine is not initialized")
-            callback.error()
-            return
-        }
-        stopRequested.set(false)
+        val tts = TtsEngine.tts!!
 
         // Note that AudioFormat.ENCODING_PCM_FLOAT requires API level >= 24
         // callback.start(tts.sampleRate(), AudioFormat.ENCODING_PCM_FLOAT, 1)
 
-        if (callback.start(tts.sampleRate(), AudioFormat.ENCODING_PCM_16BIT, 1) != TextToSpeech.SUCCESS) {
-            Log.e(TAG, "Synthesis callback refused to start")
-            return
-        }
+        callback.start(tts.sampleRate(), AudioFormat.ENCODING_PCM_16BIT, 1)
 
         if (text.isBlank() || text.isEmpty()) {
             callback.done()
             return
         }
 
-        // Retry only when the native generator has returned without delivering audio.
-        // A running JNI call cannot be safely interrupted/restarted on the same model.
-        val deliveredBytes = AtomicInteger(0)
         val ttsCallback: (FloatArray) -> Int = fun(floatSamples): Int {
-            if (stopRequested.get()) return 0
-            if (floatSamples.isEmpty()) return 1
-
+            // convert FloatArray to ByteArray
             val samples = floatArrayToByteArray(floatSamples)
-            val maxBufferSize = callback.maxBufferSize
-            if (maxBufferSize <= 0) return 0
+            val maxBufferSize: Int = callback.maxBufferSize
             var offset = 0
             while (offset < samples.size) {
-                if (stopRequested.get()) return 0
-                val bytesToWrite = minOf(maxBufferSize, samples.size - offset)
-                if (callback.audioAvailable(samples, offset, bytesToWrite) != TextToSpeech.SUCCESS) {
-                    Log.w(TAG, "Audio consumer rejected data")
-                    stopRequested.set(true)
-                    return 0
-                }
-                deliveredBytes.addAndGet(bytesToWrite)
+                val bytesToWrite = Math.min(maxBufferSize, samples.size - offset)
+                callback.audioAvailable(samples, offset, bytesToWrite)
                 offset += bytesToWrite
             }
+
+            // 1 means to continue
+            // 0 means to stop
             return 1
         }
 
+        Log.i(TAG, "text: $text")
         val genConfig = GenerationConfig(sid = TtsEngine.speakerId, speed = engineSpeed)
         var genText = text
-        try {
-            if (TtsEngine.usePhonemize) {
-                genConfig.phonemeCodepoints = TtsEngine.phonemize(text)
-                genText = ""
-            }
-
-            for (attempt in 1..2) {
-                if (stopRequested.get()) {
-                    callback.error()
-                    return
-                }
-                try {
-                    val generated = tts.generateWithConfigAndCallback(
-                        text = genText,
-                        config = genConfig,
-                        callback = ttsCallback,
-                    )
-                    if (stopRequested.get()) {
-                        callback.error()
-                        return
-                    }
-                    if (deliveredBytes.get() == 0 && generated.samples.isNotEmpty()) {
-                        ttsCallback(generated.samples)
-                    }
-                    if (deliveredBytes.get() > 0) {
-                        callback.done()
-                        return
-                    }
-                    Log.w(TAG, "TTS generated no audio (attempt $attempt)")
-                } catch (e: Exception) {
-                    Log.e(TAG, "TTS synthesis failed (attempt $attempt)", e)
-                    // Never replay text after partial audio: that would duplicate speech.
-                    if (deliveredBytes.get() > 0) break
-                }
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "TTS preparation failed", e)
+        if (TtsEngine.usePhonemize) {
+            // Phonemize outside of sherpa-onnx with piper-phonemize and pass
+            // the phoneme codepoints. The espeak-ng voice is taken from the
+            // model metadata.
+            genConfig.phonemeCodepoints = TtsEngine.phonemize(text)
+            // The text has already been phonemized; pass an empty string.
+            genText = ""
         }
+        tts.generateWithConfigAndCallback(
+            text = genText,
+            config = genConfig,
+            callback = ttsCallback,
+        )
 
-        callback.error()
+        callback.done()
     }
 
     private fun floatArrayToByteArray(audio: FloatArray): ByteArray {
