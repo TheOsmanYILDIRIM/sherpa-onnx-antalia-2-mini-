@@ -75,6 +75,7 @@ public final class AntaliaTtsService extends TextToSpeechService {
         final long[] firstAudioNs = {-1};
         final long[] totalFrames = {0};
         final int[] callbackPackets = {0};
+        final AtomicBoolean consumerFailed = new AtomicBoolean(false);
         String outcome = "unknown";
         try {
             if (onIsLanguageAvailable(request.getLanguage(), request.getCountry(),
@@ -121,15 +122,24 @@ public final class AntaliaTtsService extends TextToSpeechService {
                     int length = Math.min(max, bytes.length - offset);
                     // Timestamp before callback; the downstream player may block here.
                     if (firstAudioNs[0] < 0) firstAudioNs[0] = SystemClock.elapsedRealtimeNanos();
-                    if (callback.audioAvailable(bytes, offset, length) != TextToSpeech.SUCCESS)
+                    if (callback.audioAvailable(bytes, offset, length) != TextToSpeech.SUCCESS) {
+                        consumerFailed.set(true);
+                        stop.set(true);
                         return false;
+                    }
                     callbackPackets[0]++;
                     totalFrames[0] += length / 2;
                     offset += length;
                 }
                 return !stop.get();
             }, false);
-            if (!stop.get()) {
+            if (consumerFailed.get()) {
+                callback.error();
+                outcome = "audio_delivery_failed";
+            } else if (!stop.get() && callbackPackets[0] == 0) {
+                callback.error();
+                outcome = "no_audio";
+            } else if (!stop.get()) {
                 callback.done();
                 outcome = "done";
             } else {
