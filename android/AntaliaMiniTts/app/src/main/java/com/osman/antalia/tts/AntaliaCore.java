@@ -441,13 +441,14 @@ final class AntaliaCore implements AutoCloseable {
         open(steps,threads);
         Tone tone=new Tone();
         List<String> parts=chunks(raw);
-        float[] pending = null;
+        float[] pendingTail = null;
         for(int i=0;i<parts.size();i++) {
             if(stop.get()||Thread.currentThread().isInterrupted())break;
             String cleaned=normalizer.normalize(parts.get(i));
             if(cleaned.isBlank())continue;
             float[] audio = null;
-            boolean fadeOut = addPauses || i == parts.size() - 1;
+            boolean lastPart = i == parts.size() - 1;
+            boolean fadeOut = addPauses || lastPart;
             for (int attempt = 0; attempt < 2 && !stop.get(); attempt++) {
                 try {
                     audio = infer(cleaned, steps, speed, i, stop, fadeOut);
@@ -466,20 +467,34 @@ final class AntaliaCore implements AutoCloseable {
             audio = tone.process(audio);
             if(addPauses) {
                 if(!sink.deliver(audio))return;
-                if(i!=parts.size()-1 && !stop.get()) {
+                if(!lastPart && !stop.get()) {
                     char tail=parts.get(i).charAt(parts.get(i).length()-1);
                     int pause=(tail=='.'||tail=='!'||tail=='?')?5760:2880;
                     if(!sink.deliver(new float[pause]))return;
                 }
-            } else if (pending == null) {
-                pending = audio;
             } else {
-                int overlap = crossfadeTail(pending, audio);
-                if(!sink.deliver(pending))return;
-                pending = Arrays.copyOfRange(audio, overlap, audio.length);
+                int headSkip = 0;
+                if (pendingTail != null) {
+                    int overlap = crossfadeTail(pendingTail, audio);
+                    if(!sink.deliver(pendingTail))return;
+                    headSkip = overlap;
+                    pendingTail = null;
+                }
+                if (lastPart) {
+                    if (headSkip < audio.length
+                        && !sink.deliver(Arrays.copyOfRange(audio, headSkip, audio.length))) return;
+                } else {
+                    // Deliver immediately and retain only the final 5 ms needed for
+                    // the next crossfade; do not wait for the next model chunk.
+                    int hold = Math.min(SEAM, Math.max(0, audio.length - headSkip));
+                    int bodyEnd = audio.length - hold;
+                    if (bodyEnd > headSkip
+                        && !sink.deliver(Arrays.copyOfRange(audio, headSkip, bodyEnd))) return;
+                    pendingTail = Arrays.copyOfRange(audio, bodyEnd, audio.length);
+                }
             }
         }
-        if(!addPauses && pending != null && !stop.get()) sink.deliver(pending);
+        if(!addPauses && pendingTail != null && !stop.get()) sink.deliver(pendingTail);
     }
 
     @Override public synchronized void close(){ closeSessions(); }
