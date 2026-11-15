@@ -38,6 +38,7 @@ final class AntaliaCore implements AutoCloseable {
     private static final int HIDDEN = 192;
     private static final int BINS = 128;
     private static final int STACK = 2;
+    private static final int SEAM = 240;  // 5 ms at 48 kHz: smooth internal model-chunk joins.
     private final Context context;
     private final AntaliaNormalizer normalizer;
     private final OrtEnvironment env;
@@ -279,7 +280,7 @@ final class AntaliaCore implements AutoCloseable {
     }
 
     private float[] infer(String part, int steps, float speed, int chunkIndex,
-                          AtomicBoolean stop) throws Exception {
+                          AtomicBoolean stop, boolean fadeOut) throws Exception {
         // This matches the original 1.0.1 four-stage split: text -> cond -> flow -> vocoder.
         // The flow model is *one* Euler step and gets invoked 4 or 8 times.
         final long startNanos = System.nanoTime();
@@ -400,9 +401,11 @@ final class AntaliaCore implements AutoCloseable {
         int to = Math.min(audio.length, last * HOP);
         if (to <= from) throw new IllegalStateException("Invalid PCM crop");
         float[] clipped = Arrays.copyOfRange(audio, from, to);
-        int fade = Math.min(240, clipped.length / 2);
+        int fade = Math.min(SEAM, clipped.length / 2);
         if (prefixCount > 0) for (int i = 0; i < fade; i++) clipped[i] *= i / (float)fade;
-        for (int i = 0; i < fade; i++) clipped[clipped.length - 1 - i] *= i / (float)fade;
+        // Internal chunks are crossfaded below. Fading every chunk to absolute zero
+        // created an audible 5 ms "hiccup" exactly at the 110-character split.
+        if (fadeOut) for (int i = 0; i < fade; i++) clipped[clipped.length - 1 - i] *= i / (float)fade;
 
         lastProfile = String.format(java.util.Locale.ROOT,
             "text %.0fms · cond %.0fms · flow %.0fms · vocoder %.0fms · iSTFT %.0fms",
@@ -410,6 +413,17 @@ final class AntaliaCore implements AutoCloseable {
             (afterFlow - afterCond) / 1e6, (afterVocoder - afterFlow) / 1e6,
             (afterIstft - afterVocoder) / 1e6);
         return clipped;
+    }
+
+    static int crossfadeTail(float[] left, float[] right) {
+        if (left == null || right == null) throw new IllegalArgumentException("Null PCM chunk");
+        int overlap = Math.min(SEAM, Math.min(left.length, right.length));
+        int base = left.length - overlap;
+        for (int i = 0; i < overlap; i++) {
+            float t = (i + 1) / (float)(overlap + 1);
+            left[base + i] = left[base + i] * (1f - t) + right[i] * t;
+        }
+        return overlap;
     }
 
     synchronized void speak(String raw, int steps, int threads, float speed,
@@ -427,14 +441,16 @@ final class AntaliaCore implements AutoCloseable {
         open(steps,threads);
         Tone tone=new Tone();
         List<String> parts=chunks(raw);
+        float[] pending = null;
         for(int i=0;i<parts.size();i++) {
             if(stop.get()||Thread.currentThread().isInterrupted())break;
             String cleaned=normalizer.normalize(parts.get(i));
             if(cleaned.isBlank())continue;
             float[] audio = null;
+            boolean fadeOut = addPauses || i == parts.size() - 1;
             for (int attempt = 0; attempt < 2 && !stop.get(); attempt++) {
                 try {
-                    audio = infer(cleaned, steps, speed, i, stop);
+                    audio = infer(cleaned, steps, speed, i, stop, fadeOut);
                     if (audio.length == 0) throw new IllegalStateException("Empty PCM output");
                     break;
                 } catch (Exception failure) {
@@ -448,13 +464,22 @@ final class AntaliaCore implements AutoCloseable {
             if (stop.get()) break;
             if (audio == null) throw new IllegalStateException("No PCM after retry");
             audio = tone.process(audio);
-            if(!sink.deliver(audio))break;
-            if(addPauses && i!=parts.size()-1 && !stop.get()) {
-                char tail=parts.get(i).charAt(parts.get(i).length()-1);
-                int pause=(tail=='.'||tail=='!'||tail=='?')?5760:2880;
-                if(!sink.deliver(new float[pause]))break;
+            if(addPauses) {
+                if(!sink.deliver(audio))return;
+                if(i!=parts.size()-1 && !stop.get()) {
+                    char tail=parts.get(i).charAt(parts.get(i).length()-1);
+                    int pause=(tail=='.'||tail=='!'||tail=='?')?5760:2880;
+                    if(!sink.deliver(new float[pause]))return;
+                }
+            } else if (pending == null) {
+                pending = audio;
+            } else {
+                int overlap = crossfadeTail(pending, audio);
+                if(!sink.deliver(pending))return;
+                pending = Arrays.copyOfRange(audio, overlap, audio.length);
             }
         }
+        if(!addPauses && pending != null && !stop.get()) sink.deliver(pending);
     }
 
     @Override public synchronized void close(){ closeSessions(); }

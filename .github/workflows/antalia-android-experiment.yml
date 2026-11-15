@@ -77,7 +77,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          gradle -p android/AntaliaMiniTts :app:assembleDebug --stacktrace --no-daemon
+          gradle -p android/AntaliaMiniTts :app:testDebugUnitTest :app:assembleDebug --stacktrace --no-daemon
 
       - name: Verify ARM64 APK contains exact four-stage original models
         shell: bash
