@@ -18,13 +18,19 @@ public final class AntaliaCoreSeamTest {
         }
     }
 
-    @Test public void stageBudgetTracksHealthyDeviceLatency() {
-        assertEquals(6000L, AntaliaCore.stageBudgetMs("text", -1L));
-        assertEquals(8000L, AntaliaCore.stageBudgetMs("flow", -1L));
-        assertEquals(10000L, AntaliaCore.stageBudgetMs("vocoder", -1L));
-        assertEquals(1500L, AntaliaCore.stageBudgetMs("flow", 200L));
-        assertEquals(3750L, AntaliaCore.stageBudgetMs("flow", 1000L));
-        assertEquals(12000L, AntaliaCore.stageBudgetMs("vocoder", 6000L));
+    @Test public void stageBudgetScalesWithWorkAndRetry() {
+        assertEquals(6000L, AntaliaCore.stageBudgetMs("text", -1L, 100, 0));
+        assertEquals(12000L, AntaliaCore.stageBudgetMs("text", -1L, 100, 2));
+        assertEquals(3750L, AntaliaCore.stageBudgetMs("flow", 10_000L, 100, 0));
+        assertEquals(6750L, AntaliaCore.stageBudgetMs("flow", 10_000L, 200, 0));
+        assertEquals(6000L, AntaliaCore.stageBudgetMs("flow", 10_000L, 100, 1));
+        assertEquals(9500L, AntaliaCore.stageBudgetMs("flow", 10_000L, 100, 2));
+    }
+
+    @Test public void learnedUnitCostAdaptsUpFasterThanDown() {
+        assertEquals(10_000L, AntaliaCore.updatedUnitBaselineUs(-1L, 1000L, 100));
+        assertEquals(15_000L, AntaliaCore.updatedUnitBaselineUs(10_000L, 2000L, 100));
+        assertEquals(9_375L, AntaliaCore.updatedUnitBaselineUs(10_000L, 500L, 100));
     }
 
     @Test public void seamTransitionsInsteadOfDroppingToZero() {

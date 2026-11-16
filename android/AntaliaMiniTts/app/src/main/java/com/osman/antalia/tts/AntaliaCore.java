@@ -20,6 +20,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Random;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -59,8 +60,19 @@ final class AntaliaCore implements AutoCloseable {
             worker.setDaemon(true);
             return worker;
         });
-    private final ConcurrentHashMap<String, Long> typicalStageMs = new ConcurrentHashMap<>();
-    private static final String TIMING_PREFS = "antalia_watchdog_timings";
+    private final ConcurrentHashMap<String, Long> typicalStageUnitUs = new ConcurrentHashMap<>();
+    private static final String TIMING_PREFS = "antalia_watchdog_timings_v2";
+
+    private static final class ProgressHeartbeat {
+        private final AtomicLong sequence = new AtomicLong();
+        private volatile long lastProgressMs = SystemClock.elapsedRealtime();
+        long pulse() {
+            lastProgressMs = SystemClock.elapsedRealtime();
+            return sequence.incrementAndGet();
+        }
+        long sequence() { return sequence.get(); }
+        long idleMs() { return Math.max(0L, SystemClock.elapsedRealtime() - lastProgressMs); }
+    }
 
     /** One engine per app process; shared with Android TTS service. */
     static synchronized AntaliaCore shared(Context context) {
@@ -85,7 +97,7 @@ final class AntaliaCore implements AutoCloseable {
         android.content.SharedPreferences prefs = this.context.getSharedPreferences(TIMING_PREFS, Context.MODE_PRIVATE);
         for (String stage : new String[]{"text","cond","flow","vocoder"}) {
             long saved = prefs.getLong(stage, -1L);
-            if (saved > 0L) typicalStageMs.put(stage, saved);
+            if (saved > 0L) typicalStageUnitUs.put(stage, saved);
         }
     }
 
@@ -241,40 +253,63 @@ final class AntaliaCore implements AutoCloseable {
         }
     }
 
-    static long stageBudgetMs(String stage, long baselineMs) {
-        if (baselineMs > 0L) {
-            // Hang detection follows the device's observed healthy latency instead of a
-            // fixed first-PCM timeout. 3x EWMA + 750 ms tolerates normal jitter while
-            // still recovering within a few seconds on a normally fast device.
-            return Math.max(1500L, Math.min(12000L, baselineMs * 3L + 750L));
+    static long stageBudgetMs(String stage, long baselineUnitUs, int complexity, int attempt) {
+        int units = Math.max(1, complexity);
+        int retry = Math.max(0, Math.min(2, attempt));
+        if (baselineUnitUs > 0L) {
+            long expectedMs = Math.max(1L, (baselineUnitUs * units + 999L) / 1000L);
+            long multiplier = retry == 0 ? 3L : (retry == 1 ? 5L : 8L);
+            long margin = retry == 0 ? 750L : (retry == 1 ? 1000L : 1500L);
+            long floor = retry == 0 ? 1500L : (retry == 1 ? 2500L : 4000L);
+            long ceiling = retry == 0 ? 12000L : (retry == 1 ? 20000L : 30000L);
+            return Math.max(floor, Math.min(ceiling, expectedMs * multiplier + margin));
         }
-        if ("text".equals(stage)) return 6000L;
-        if ("cond".equals(stage)) return 8000L;
-        if ("flow".equals(stage)) return 8000L;
-        return 10000L; // vocoder: cold-start fallback until a healthy sample is learned.
+        long cold = "text".equals(stage) ? 6000L
+            : ("vocoder".equals(stage) ? 10000L : 8000L);
+        if (retry == 1) cold = cold * 3L / 2L;
+        if (retry == 2) cold = cold * 2L;
+        return cold;
     }
 
-    private void recordHealthyStage(String stage, long elapsedMs) {
-        long prior = typicalStageMs.getOrDefault(stage, -1L);
-        long next = prior <= 0L ? elapsedMs : Math.max(1L, (3L * prior + elapsedMs) / 4L);
-        typicalStageMs.put(stage, next);
+    static long updatedUnitBaselineUs(long priorUnitUs, long elapsedMs, int complexity) {
+        long observed = Math.max(1L, elapsedMs * 1000L / Math.max(1, complexity));
+        if (priorUnitUs <= 0L) return observed;
+        // Adapt upward quickly so a legitimately heavier operating state is not
+        // repeatedly killed; decay downward slowly so one very fast run does not
+        // make the watchdog over-aggressive.
+        if (observed > priorUnitUs) return Math.max(1L, (priorUnitUs + observed) / 2L);
+        return Math.max(1L, (7L * priorUnitUs + observed) / 8L);
+    }
+
+    private void recordHealthyStage(String stage, long elapsedMs, int complexity) {
+        long prior = typicalStageUnitUs.getOrDefault(stage, -1L);
+        long next = updatedUnitBaselineUs(prior, elapsedMs, complexity);
+        typicalStageUnitUs.put(stage, next);
         context.getSharedPreferences(TIMING_PREFS, Context.MODE_PRIVATE)
             .edit().putLong(stage, next).apply();
     }
 
-    /** Per-stage deadline with learned timings; ONNX termination avoids concurrent native runs. */
+    /** A run is killed only when it is both abnormally slow and has produced no
+     * pipeline progress heartbeat. Retry attempts widen the learned budget. */
     private OrtSession.Result runWatched(OrtSession session, Map<String, OnnxTensor> inputs,
-                                         AtomicBoolean stop, String stage, int complexity) throws Exception {
+                                         AtomicBoolean stop, String stage, int complexity,
+                                         int attempt, ProgressHeartbeat heartbeat) throws Exception {
         if (stop.get()) throw new java.util.concurrent.CancellationException("TTS stopped");
-        Long baseline = typicalStageMs.get(stage);
-        long budgetMs = stageBudgetMs(stage, baseline == null ? -1L : baseline);
-        long started = SystemClock.elapsedRealtime();
+        Long baseline = typicalStageUnitUs.get(stage);
+        final long budgetMs = stageBudgetMs(stage, baseline == null ? -1L : baseline, complexity, attempt);
+        final long started = SystemClock.elapsedRealtime();
+        final long startSequence = heartbeat.pulse();
+        final long noProgressWindowMs = Math.max(1000L, Math.min(3000L, budgetMs / 2L));
         AtomicBoolean active = new AtomicBoolean(true);
         AtomicBoolean timedOut = new AtomicBoolean(false);
         try (OrtSession.RunOptions runOptions = new OrtSession.RunOptions()) {
             ScheduledFuture<?> watcher = RUN_WATCHDOG.scheduleAtFixedRate(() -> {
                 if (!active.get()) return;
-                boolean timeout = SystemClock.elapsedRealtime() - started > budgetMs;
+                long elapsed = SystemClock.elapsedRealtime() - started;
+                boolean abnormallySlow = elapsed > budgetMs;
+                boolean noProgress = heartbeat.sequence() == startSequence
+                    && heartbeat.idleMs() > noProgressWindowMs;
+                boolean timeout = abnormallySlow && noProgress;
                 if (timeout) timedOut.set(true);
                 if (timeout || stop.get()) {
                     try { runOptions.setTerminate(true); }
@@ -286,14 +321,16 @@ final class AntaliaCore implements AutoCloseable {
                 if (stop.get() || timedOut.get()) {
                     output.close();
                     throw new java.util.concurrent.CancellationException(
-                        timedOut.get() ? "ONNX " + stage + " timed out" : "TTS stopped");
+                        timedOut.get() ? "ONNX " + stage + " stalled" : "TTS stopped");
                 }
                 long elapsed = Math.max(1L, SystemClock.elapsedRealtime() - started);
-                recordHealthyStage(stage, elapsed);
+                recordHealthyStage(stage, elapsed, complexity);
+                heartbeat.pulse();
                 return output;
             } catch (Exception e) {
                 if (timedOut.get()) Log.w("AntaliaTtsWatchdog",
-                    "Stage " + stage + " timed out after " + budgetMs + "ms", e);
+                    "Stage " + stage + " stalled after " + budgetMs + "ms without progress"
+                    + " (attempt " + (attempt + 1) + ")", e);
                 throw e;
             } finally {
                 active.set(false);
@@ -303,7 +340,8 @@ final class AntaliaCore implements AutoCloseable {
     }
 
     private float[] infer(String part, int steps, float speed, int chunkIndex,
-                          AtomicBoolean stop, boolean fadeOut) throws Exception {
+                          AtomicBoolean stop, boolean fadeOut, int attempt,
+                          ProgressHeartbeat heartbeat) throws Exception {
         // This matches the original 1.0.1 four-stage split: text -> cond -> flow -> vocoder.
         // The flow model is *one* Euler step and gets invoked 4 or 8 times.
         final long startNanos = System.nanoTime();
@@ -313,7 +351,7 @@ final class AntaliaCore implements AutoCloseable {
         float[][] hidden;
         float[] logd;
         try (OnnxTensor idsTensor = OnnxTensor.createTensor(env, LongBuffer.wrap(ids), new long[]{1, ids.length});
-             OrtSession.Result result = runWatched(text, Collections.singletonMap("ids", idsTensor), stop, "text", ids.length)) {
+             OrtSession.Result result = runWatched(text, Collections.singletonMap("ids", idsTensor), stop, "text", ids.length, attempt, heartbeat)) {
             hidden = ((float[][][])result.get("h").orElseThrow().getValue())[0];
             logd = ((float[][])result.get("logd").orElseThrow().getValue())[0];
         }
@@ -354,7 +392,7 @@ final class AntaliaCore implements AutoCloseable {
                                       new long[]{1, ids.length, HIDDEN});
              OnnxTensor idx = OnnxTensor.createTensor(env, LongBuffer.wrap(index),
                                         new long[]{1, frames});
-             OrtSession.Result result = runWatched(conditioning, feed("h", h, "idx", idx), stop, "cond", frames)) {
+             OrtSession.Result result = runWatched(conditioning, feed("h", h, "idx", idx), stop, "cond", frames, attempt, heartbeat)) {
             ctok = ((float[][][])result.get("ctok").orElseThrow().getValue())[0];
             cnull = ((float[][][])result.get("cnull").orElseThrow().getValue())[0];
         }
@@ -389,7 +427,7 @@ final class AntaliaCore implements AutoCloseable {
                      OnnxTensor t = OnnxTensor.createTensor(env, FloatBuffer.wrap(new float[]{step * dtv}),
                                                  new long[]{1});
                      OrtSession.Result result = runWatched(flow, feed("x", x, "ctok", ctx, "cnull", nul,
-                                                              "t", t, "dt", dt, "cfg", cfg), stop, "flow", halfFrames)) {
+                                                              "t", t, "dt", dt, "cfg", cfg), stop, "flow", halfFrames, attempt, heartbeat)) {
                     float[][] next = ((float[][][])result.get("x_next").orElseThrow().getValue())[0];
                     if (next.length != halfFrames) throw new IllegalStateException("Flow frame mismatch");
                     for (int i = 0; i < halfFrames; i++) {
@@ -405,7 +443,7 @@ final class AntaliaCore implements AutoCloseable {
         long afterVocoder;
         try (OnnxTensor z = OnnxTensor.createTensor(env, FloatBuffer.wrap(noise),
                                             new long[]{1, halfFrames, BINS * STACK});
-             OrtSession.Result result = runWatched(vocoder, Collections.singletonMap("z", z), stop, "vocoder", halfFrames)) {
+             OrtSession.Result result = runWatched(vocoder, Collections.singletonMap("z", z), stop, "vocoder", halfFrames, attempt, heartbeat)) {
             float[][] re = ((float[][][])result.get("re").orElseThrow().getValue())[0];
             float[][] im = ((float[][][])result.get("im").orElseThrow().getValue())[0];
             afterVocoder = System.nanoTime();
@@ -473,9 +511,11 @@ final class AntaliaCore implements AutoCloseable {
             boolean lastPart = i == parts.size() - 1;
             boolean fadeOut = addPauses || lastPart;
             int maxAttempts = i == 0 ? 3 : 2;
+            ProgressHeartbeat heartbeat = new ProgressHeartbeat();
             for (int attempt = 0; attempt < maxAttempts && !stop.get(); attempt++) {
                 try {
-                    audio = infer(cleaned, steps, speed, i, stop, fadeOut);
+                    heartbeat.pulse();
+                    audio = infer(cleaned, steps, speed, i, stop, fadeOut, attempt, heartbeat);
                     if (audio.length == 0) throw new IllegalStateException("Empty PCM output");
                     break;
                 } catch (Exception failure) {
