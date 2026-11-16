@@ -60,7 +60,7 @@ final class AntaliaCore implements AutoCloseable {
             return worker;
         });
     private final ConcurrentHashMap<String, Long> typicalStageMs = new ConcurrentHashMap<>();
-    private long typicalFirstChunkMs = -1L;
+    private static final String TIMING_PREFS = "antalia_watchdog_timings";
 
     /** One engine per app process; shared with Android TTS service. */
     static synchronized AntaliaCore shared(Context context) {
@@ -82,6 +82,11 @@ final class AntaliaCore implements AutoCloseable {
         this.context = context.getApplicationContext();
         normalizer = new AntaliaNormalizer(this.context);
         env = OrtEnvironment.getEnvironment();
+        android.content.SharedPreferences prefs = this.context.getSharedPreferences(TIMING_PREFS, Context.MODE_PRIVATE);
+        for (String stage : new String[]{"text","cond","flow","vocoder"}) {
+            long saved = prefs.getLong(stage, -1L);
+            if (saved > 0L) typicalStageMs.put(stage, saved);
+        }
     }
 
     private static String sha256(File file) throws Exception {
@@ -236,31 +241,34 @@ final class AntaliaCore implements AutoCloseable {
         }
     }
 
-    static long startupBudgetMs(int steps, long baselineMs) {
-        long cold = steps == 8 ? 70000L : 40000L;
-        if (baselineMs <= 0L) return cold;
-        long floor = steps == 8 ? 30000L : 20000L;
-        long ceiling = steps == 8 ? 90000L : 60000L;
-        long adaptive = baselineMs * 2L + 5000L;
-        return Math.max(floor, Math.min(ceiling, adaptive));
+    static long stageBudgetMs(String stage, long baselineMs) {
+        if (baselineMs > 0L) {
+            // Hang detection follows the device's observed healthy latency instead of a
+            // fixed first-PCM timeout. 3x EWMA + 750 ms tolerates normal jitter while
+            // still recovering within a few seconds on a normally fast device.
+            return Math.max(1500L, Math.min(12000L, baselineMs * 3L + 750L));
+        }
+        if ("text".equals(stage)) return 6000L;
+        if ("cond".equals(stage)) return 8000L;
+        if ("flow".equals(stage)) return 8000L;
+        return 10000L; // vocoder: cold-start fallback until a healthy sample is learned.
+    }
+
+    private void recordHealthyStage(String stage, long elapsedMs) {
+        long prior = typicalStageMs.getOrDefault(stage, -1L);
+        long next = prior <= 0L ? elapsedMs : Math.max(1L, (3L * prior + elapsedMs) / 4L);
+        typicalStageMs.put(stage, next);
+        context.getSharedPreferences(TIMING_PREFS, Context.MODE_PRIVATE)
+            .edit().putLong(stage, next).apply();
     }
 
     /** Per-stage deadline with learned timings; ONNX termination avoids concurrent native runs. */
     private OrtSession.Result runWatched(OrtSession session, Map<String, OnnxTensor> inputs,
-                                         AtomicBoolean stop, String stage, int complexity,
-                                         long absoluteDeadlineMs) throws Exception {
+                                         AtomicBoolean stop, String stage, int complexity) throws Exception {
         if (stop.get()) throw new java.util.concurrent.CancellationException("TTS stopped");
-        long floorMs = "vocoder".equals(stage) ? 20000L : ("flow".equals(stage) ? 15000L : 12000L);
-        long multiplier = Math.max(1L, (complexity + 499L) / 500L);
-        long defaultMs = Math.min(90000L, floorMs * multiplier);
         Long baseline = typicalStageMs.get(stage);
-        long budgetMs = Math.min(90000L, Math.max(defaultMs,
-            baseline == null ? 0L : baseline * 4L + 3000L));
+        long budgetMs = stageBudgetMs(stage, baseline == null ? -1L : baseline);
         long started = SystemClock.elapsedRealtime();
-        if (absoluteDeadlineMs > 0L) {
-            long remaining = Math.max(1L, absoluteDeadlineMs - started);
-            budgetMs = Math.min(budgetMs, remaining);
-        }
         AtomicBoolean active = new AtomicBoolean(true);
         AtomicBoolean timedOut = new AtomicBoolean(false);
         try (OrtSession.RunOptions runOptions = new OrtSession.RunOptions()) {
@@ -281,7 +289,7 @@ final class AntaliaCore implements AutoCloseable {
                         timedOut.get() ? "ONNX " + stage + " timed out" : "TTS stopped");
                 }
                 long elapsed = Math.max(1L, SystemClock.elapsedRealtime() - started);
-                typicalStageMs.merge(stage, elapsed, (a, b) -> (3L * a + b) / 4L);
+                recordHealthyStage(stage, elapsed);
                 return output;
             } catch (Exception e) {
                 if (timedOut.get()) Log.w("AntaliaTtsWatchdog",
@@ -295,8 +303,7 @@ final class AntaliaCore implements AutoCloseable {
     }
 
     private float[] infer(String part, int steps, float speed, int chunkIndex,
-                          AtomicBoolean stop, boolean fadeOut,
-                          long firstAudioDeadlineMs) throws Exception {
+                          AtomicBoolean stop, boolean fadeOut) throws Exception {
         // This matches the original 1.0.1 four-stage split: text -> cond -> flow -> vocoder.
         // The flow model is *one* Euler step and gets invoked 4 or 8 times.
         final long startNanos = System.nanoTime();
@@ -306,7 +313,7 @@ final class AntaliaCore implements AutoCloseable {
         float[][] hidden;
         float[] logd;
         try (OnnxTensor idsTensor = OnnxTensor.createTensor(env, LongBuffer.wrap(ids), new long[]{1, ids.length});
-             OrtSession.Result result = runWatched(text, Collections.singletonMap("ids", idsTensor), stop, "text", ids.length, firstAudioDeadlineMs)) {
+             OrtSession.Result result = runWatched(text, Collections.singletonMap("ids", idsTensor), stop, "text", ids.length)) {
             hidden = ((float[][][])result.get("h").orElseThrow().getValue())[0];
             logd = ((float[][])result.get("logd").orElseThrow().getValue())[0];
         }
@@ -347,7 +354,7 @@ final class AntaliaCore implements AutoCloseable {
                                       new long[]{1, ids.length, HIDDEN});
              OnnxTensor idx = OnnxTensor.createTensor(env, LongBuffer.wrap(index),
                                         new long[]{1, frames});
-             OrtSession.Result result = runWatched(conditioning, feed("h", h, "idx", idx), stop, "cond", frames, firstAudioDeadlineMs)) {
+             OrtSession.Result result = runWatched(conditioning, feed("h", h, "idx", idx), stop, "cond", frames)) {
             ctok = ((float[][][])result.get("ctok").orElseThrow().getValue())[0];
             cnull = ((float[][][])result.get("cnull").orElseThrow().getValue())[0];
         }
@@ -382,7 +389,7 @@ final class AntaliaCore implements AutoCloseable {
                      OnnxTensor t = OnnxTensor.createTensor(env, FloatBuffer.wrap(new float[]{step * dtv}),
                                                  new long[]{1});
                      OrtSession.Result result = runWatched(flow, feed("x", x, "ctok", ctx, "cnull", nul,
-                                                              "t", t, "dt", dt, "cfg", cfg), stop, "flow", halfFrames, firstAudioDeadlineMs)) {
+                                                              "t", t, "dt", dt, "cfg", cfg), stop, "flow", halfFrames)) {
                     float[][] next = ((float[][][])result.get("x_next").orElseThrow().getValue())[0];
                     if (next.length != halfFrames) throw new IllegalStateException("Flow frame mismatch");
                     for (int i = 0; i < halfFrames; i++) {
@@ -398,7 +405,7 @@ final class AntaliaCore implements AutoCloseable {
         long afterVocoder;
         try (OnnxTensor z = OnnxTensor.createTensor(env, FloatBuffer.wrap(noise),
                                             new long[]{1, halfFrames, BINS * STACK});
-             OrtSession.Result result = runWatched(vocoder, Collections.singletonMap("z", z), stop, "vocoder", halfFrames, firstAudioDeadlineMs)) {
+             OrtSession.Result result = runWatched(vocoder, Collections.singletonMap("z", z), stop, "vocoder", halfFrames)) {
             float[][] re = ((float[][][])result.get("re").orElseThrow().getValue())[0];
             float[][] im = ((float[][][])result.get("im").orElseThrow().getValue())[0];
             afterVocoder = System.nanoTime();
@@ -467,17 +474,9 @@ final class AntaliaCore implements AutoCloseable {
             boolean fadeOut = addPauses || lastPart;
             int maxAttempts = i == 0 ? 3 : 2;
             for (int attempt = 0; attempt < maxAttempts && !stop.get(); attempt++) {
-                long attemptStartedMs = SystemClock.elapsedRealtime();
-                long firstAudioDeadlineMs = i == 0
-                    ? attemptStartedMs + startupBudgetMs(steps, typicalFirstChunkMs) : 0L;
                 try {
-                    audio = infer(cleaned, steps, speed, i, stop, fadeOut, firstAudioDeadlineMs);
+                    audio = infer(cleaned, steps, speed, i, stop, fadeOut);
                     if (audio.length == 0) throw new IllegalStateException("Empty PCM output");
-                    if (i == 0) {
-                        long elapsed = Math.max(1L, SystemClock.elapsedRealtime() - attemptStartedMs);
-                        typicalFirstChunkMs = typicalFirstChunkMs <= 0L ? elapsed
-                            : (3L * typicalFirstChunkMs + elapsed) / 4L;
-                    }
                     break;
                 } catch (Exception failure) {
                     if (stop.get()) throw failure;

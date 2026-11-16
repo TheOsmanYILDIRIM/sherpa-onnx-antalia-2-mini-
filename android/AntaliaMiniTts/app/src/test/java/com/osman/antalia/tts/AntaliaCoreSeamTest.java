@@ -18,12 +18,13 @@ public final class AntaliaCoreSeamTest {
         }
     }
 
-    @Test public void startupBudgetAdaptsAfterHealthyFirstChunk() {
-        assertEquals(40000L, AntaliaCore.startupBudgetMs(4, -1L));
-        assertEquals(20000L, AntaliaCore.startupBudgetMs(4, 4000L));
-        assertEquals(25000L, AntaliaCore.startupBudgetMs(4, 10000L));
-        assertEquals(60000L, AntaliaCore.startupBudgetMs(4, 40000L));
-        assertEquals(70000L, AntaliaCore.startupBudgetMs(8, -1L));
+    @Test public void stageBudgetTracksHealthyDeviceLatency() {
+        assertEquals(6000L, AntaliaCore.stageBudgetMs("text", -1L));
+        assertEquals(8000L, AntaliaCore.stageBudgetMs("flow", -1L));
+        assertEquals(10000L, AntaliaCore.stageBudgetMs("vocoder", -1L));
+        assertEquals(1500L, AntaliaCore.stageBudgetMs("flow", 200L));
+        assertEquals(3750L, AntaliaCore.stageBudgetMs("flow", 1000L));
+        assertEquals(12000L, AntaliaCore.stageBudgetMs("vocoder", 6000L));
     }
 
     @Test public void seamTransitionsInsteadOfDroppingToZero() {
