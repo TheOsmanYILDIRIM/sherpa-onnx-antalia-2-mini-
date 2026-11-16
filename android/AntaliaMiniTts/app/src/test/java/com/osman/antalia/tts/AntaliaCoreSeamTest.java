@@ -18,6 +18,14 @@ public final class AntaliaCoreSeamTest {
         }
     }
 
+    @Test public void startupBudgetAdaptsAfterHealthyFirstChunk() {
+        assertEquals(40000L, AntaliaCore.startupBudgetMs(4, -1L));
+        assertEquals(20000L, AntaliaCore.startupBudgetMs(4, 4000L));
+        assertEquals(25000L, AntaliaCore.startupBudgetMs(4, 10000L));
+        assertEquals(60000L, AntaliaCore.startupBudgetMs(4, 40000L));
+        assertEquals(70000L, AntaliaCore.startupBudgetMs(8, -1L));
+    }
+
     @Test public void seamTransitionsInsteadOfDroppingToZero() {
         float[] left = new float[300];
         float[] right = new float[300];
