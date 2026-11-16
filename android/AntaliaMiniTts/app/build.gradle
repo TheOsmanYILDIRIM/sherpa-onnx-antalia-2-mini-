@@ -20,6 +20,10 @@ android {
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
         release {
+            // Production-like installable build: R8/resource shrinking enabled and
+            // non-debuggable. CI uses the standard debug signing key only so the
+            // resulting release APK can be sideloaded for device verification.
+            signingConfig signingConfigs.debug
             minifyEnabled true
             shrinkResources true
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
