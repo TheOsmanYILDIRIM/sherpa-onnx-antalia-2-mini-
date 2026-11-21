@@ -51,8 +51,9 @@ final class AntaliaDiagnostics {
 
     static void exception(Context context, String area, String detail, Throwable error) {
         String type = error == null ? "null" : error.getClass().getSimpleName();
-        String message = error == null ? "" : error.getMessage();
-        event(context, area, detail + " error=" + type + " message=" + sanitize(message));
+        // Do not persist exception messages: some validation errors can echo a
+        // symbol derived from the user's private utterance.
+        event(context, area, detail + " error=" + type);
     }
 
     static String snapshot(Context context) {
