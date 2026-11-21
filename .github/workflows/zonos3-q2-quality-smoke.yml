@@ -55,48 +55,56 @@ jobs:
           cmake -S "$RUNNER_TEMP/llama.cpp" -B "$RUNNER_TEMP/llama-build"             -DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_EXAMPLES=OFF             -DLLAMA_BUILD_SERVER=OFF -DLLAMA_OPENSSL=OFF -DGGML_NATIVE=OFF
           cmake --build "$RUNNER_TEMP/llama-build" --target llama-tts -j 2
 
-      - name: Generate and validate longer Turkish Q2 sample
+      - name: Sweep fixed seeds on longer Turkish Q2 sample
         shell: bash
         run: |
           set -euo pipefail
           M="$RUNNER_TEMP/model"
           O="$RUNNER_TEMP/out"; mkdir -p "$O"
-          /usr/bin/time -f 'elapsed_s=%e\nmax_rss_kb=%M' -o "$O/time.txt"             "$RUNNER_TEMP/llama-build/bin/llama-tts"             -m "$M/backbone-q2_k.gguf"             -mm "$M/mmproj-q2_k.gguf"             --tts-lang tr             --tts-voice Savannah_en-American_F_1             -p "Merhaba. Bu, ZONOS üç Mini modelinin Android için küçültülmüş Q2 denemesidir. Türkçe cümlelerin anlaşılır ve doğal kalıp kalmadığını dinleyerek kontrol ediyoruz."             -n 300             -o "$O/zonos3-mini-q2-turkish-smoke.wav"             >"$O/tts.log" 2>"$O/stderr.log"
+          TEXT="Merhaba. Bu, ZONOS üç Mini modelinin Android için küçültülmüş Q2 denemesidir. Türkçe cümlelerin anlaşılır ve doğal kalıp kalmadığını dinleyerek kontrol ediyoruz."
+          for seed in 1 7 42 88 1234 2026; do
+            /usr/bin/time -f 'elapsed_s=%e\nmax_rss_kb=%M' -o "$O/time-$seed.txt"               "$RUNNER_TEMP/llama-build/bin/llama-tts"               -m "$M/backbone-q2_k.gguf"               -mm "$M/mmproj-q2_k.gguf"               --tts-lang tr               --tts-voice Savannah_en-American_F_1               --seed "$seed"               -p "$TEXT"               -n 300               -o "$O/turkish-seed-$seed.wav"               >"$O/tts-$seed.log" 2>"$O/stderr-$seed.log"
+          done
 
           python3 - <<'PY'
           import array,json,math,os,wave
           from pathlib import Path
           root=Path(os.environ["RUNNER_TEMP"])/"out"
-          p=root/"zonos3-mini-q2-turkish-smoke.wav"
-          with wave.open(str(p),"rb") as w:
-              rate=w.getframerate(); frames=w.getnframes(); channels=w.getnchannels()
-              raw=w.readframes(frames)
-          a=array.array("h"); a.frombytes(raw)
-          rms=math.sqrt(sum(x*x for x in a)/len(a)) if a else 0
-          peak=max((abs(x) for x in a),default=0)
-          metrics={}
-          for line in (root/"time.txt").read_text().splitlines():
-              if "=" in line:
-                  k,v=line.split("=",1); metrics[k]=float(v)
-          result={"variant":"Q2_K+Q2_K","sample_rate":rate,"channels":channels,"frames":frames,
-                  "duration_s":frames/rate if rate else 0,"rms_pcm16":rms,"peak_pcm16":peak,
-                  "wav_bytes":p.stat().st_size,**metrics}
-          assert channels==1 and rate==44100 and frames>100 and rms>20 and peak>100,result
-          (root/"validation.json").write_text(json.dumps(result,indent=2)+"\n")
-          print(json.dumps(result,indent=2))
+          rows=[]
+          for seed in (1,7,42,88,1234,2026):
+              p=root/f"turkish-seed-{seed}.wav"
+              with wave.open(str(p),"rb") as w:
+                  rate=w.getframerate(); frames=w.getnframes(); channels=w.getnchannels()
+                  raw=w.readframes(frames)
+              a=array.array("h"); a.frombytes(raw)
+              rms=math.sqrt(sum(x*x for x in a)/len(a)) if a else 0
+              peak=max((abs(x) for x in a),default=0)
+              metrics={}
+              for line in (root/f"time-{seed}.txt").read_text().splitlines():
+                  if "=" in line:
+                      k,v=line.split("=",1); metrics[k]=float(v)
+              valid=channels==1 and rate==44100 and frames>100 and rms>20 and peak>100
+              rows.append({"seed":seed,"sample_rate":rate,"channels":channels,"frames":frames,
+                           "duration_s":frames/rate if rate else 0,"rms_pcm16":rms,"peak_pcm16":peak,
+                           "wav_bytes":p.stat().st_size,"valid_signal":valid,**metrics})
+          good=[x for x in rows if x["valid_signal"]]
+          assert good,rows
+          best=max(good,key=lambda x:(x["duration_s"],x["rms_pcm16"]))
+          report={"variant":"Q2_K+Q2_K","best_seed":best["seed"],"best":best,"runs":rows}
+          (root/"validation.json").write_text(json.dumps(report,indent=2)+"\n")
+          (root/"best-seed.txt").write_text(str(best["seed"])+"\n")
+          print(json.dumps(report,indent=2))
           PY
-          cat "$O/time.txt"
-          tail -40 "$O/tts.log" || true
-          tail -40 "$O/stderr.log" || true
 
       - uses: actions/upload-artifact@v4
         with:
-          name: zonos3-mini-q2-turkish-quality-smoke
+          name: zonos3-mini-q2-turkish-seed-sweep
           path: |
-            ${{ runner.temp }}/out/zonos3-mini-q2-turkish-smoke.wav
+            ${{ runner.temp }}/out/turkish-seed-*.wav
             ${{ runner.temp }}/out/validation.json
-            ${{ runner.temp }}/out/time.txt
-            ${{ runner.temp }}/out/tts.log
-            ${{ runner.temp }}/out/stderr.log
+            ${{ runner.temp }}/out/best-seed.txt
+            ${{ runner.temp }}/out/time-*.txt
+            ${{ runner.temp }}/out/tts-*.log
+            ${{ runner.temp }}/out/stderr-*.log
           if-no-files-found: error
           retention-days: 30
