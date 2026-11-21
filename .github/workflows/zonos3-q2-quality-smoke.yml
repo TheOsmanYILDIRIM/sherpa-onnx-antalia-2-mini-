@@ -1,0 +1,92 @@
+name: ZONOS3 Mini Q2 Turkish quality smoke
+
+on:
+  push:
+    branches:
+      - experiment/zonos3-mini-android-q2-20261121
+    paths:
+      - .github/workflows/zonos3-q2-quality-smoke.yml
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  turkish-smoke:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download verified smallest model artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_id="$(gh run list             --repo "$GITHUB_REPOSITORY"             --workflow "ZONOS3 Mini Q2 publish smallest model ZIP"             --branch "experiment/zonos3-mini-android-q2-20261121"             --status success             --limit 1             --json databaseId             --jq '.[0].databaseId')"
+          test -n "$run_id"
+          mkdir -p "$RUNNER_TEMP/in"
+          gh run download "$run_id"             --repo "$GITHUB_REPOSITORY"             --name zonos3-mini-android-q2-q2-smallest-model             --dir "$RUNNER_TEMP/in"
+          mkdir -p "$RUNNER_TEMP/model"
+          unzip -q "$RUNNER_TEMP/in/zonos3-mini-android-q2_k-q2_k.zip" -d "$RUNNER_TEMP/model"
+          python3 - <<'PY'
+          import json,hashlib,os
+          from pathlib import Path
+          root=Path(os.environ["RUNNER_TEMP"])/"model"
+          m=json.loads((root/"zonos3-package.json").read_text())
+          assert m["variant"]=="Q2_K+Q2_K"
+          for x in m["files"].values():
+              p=root/x["name"]
+              h=hashlib.sha256(p.read_bytes()).hexdigest()
+              assert p.stat().st_size==x["size"] and h==x["sha256"]
+          print(m["variant"])
+          PY
+
+      - name: Build pinned llama-tts
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/ggml-org/llama.cpp "$RUNNER_TEMP/llama.cpp"
+          git -C "$RUNNER_TEMP/llama.cpp" checkout e6d624b9a4b95c6b52f5ca384d70b75581f9821a
+          cmake -S "$RUNNER_TEMP/llama.cpp" -B "$RUNNER_TEMP/llama-build"             -DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_EXAMPLES=OFF             -DLLAMA_BUILD_SERVER=OFF -DLLAMA_OPENSSL=OFF -DGGML_NATIVE=OFF
+          cmake --build "$RUNNER_TEMP/llama-build" --target llama-tts -j 2
+
+      - name: Generate longer Turkish sample and measure
+        shell: bash
+        run: |
+          set -euo pipefail
+          M="$RUNNER_TEMP/model"
+          O="$RUNNER_TEMP/out"
+          mkdir -p "$O"
+          /usr/bin/time -v "$RUNNER_TEMP/llama-build/bin/llama-tts"             -m "$M/backbone-q2_k.gguf"             -mm "$M/mmproj-q2_k.gguf"             --tts-lang tr             --tts-voice Savannah_en-American_F_1             -p "Merhaba. Bu, ZONOS üç Mini modelinin Android için küçültülmüş Q2 denemesidir. Türkçe cümlelerin anlaşılır ve doğal kalıp kalmadığını dinleyerek kontrol ediyoruz."             -n 180             -o "$O/zonos3-mini-q2-turkish-smoke.wav"             >"$O/tts.log" 2>"$O/time-and-stderr.log"
+          python3 - <<'PY'
+          import array,json,math,os,wave
+          from pathlib import Path
+          p=Path(os.environ["RUNNER_TEMP"])/"out"/"zonos3-mini-q2-turkish-smoke.wav"
+          with wave.open(str(p),"rb") as w:
+              rate=w.getframerate(); frames=w.getnframes(); channels=w.getnchannels()
+              raw=w.readframes(frames)
+          assert channels==1 and rate==44100 and frames>rate
+          a=array.array("h");a.frombytes(raw)
+          rms=math.sqrt(sum(x*x for x in a)/len(a))
+          peak=max(abs(x) for x in a)
+          assert rms>20 and peak>100
+          result={"sample_rate":rate,"frames":frames,"duration_s":frames/rate,"rms_pcm16":rms,"peak_pcm16":peak,"wav_bytes":p.stat().st_size}
+          (p.parent/"validation.json").write_text(json.dumps(result,indent=2)+"\n")
+          print(json.dumps(result,indent=2))
+          PY
+          cat "$O/time-and-stderr.log"
+          cat "$O/tts.log"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zonos3-mini-q2-turkish-quality-smoke
+          path: |
+            ${{ runner.temp }}/out/zonos3-mini-q2-turkish-smoke.wav
+            ${{ runner.temp }}/out/validation.json
+            ${{ runner.temp }}/out/time-and-stderr.log
+            ${{ runner.temp }}/out/tts.log
+          if-no-files-found: error
+          retention-days: 30
