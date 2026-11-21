@@ -15,3 +15,5 @@ CI, ggml-org/llama.cpp commit e6d624b9a4b95c6b52f5ca384d70b75581f9821a sürümü
 ## Deney quantları
 
 zonos3-q2-model-package.yml aynı Q2_K backbone ile mmproj için Q8_0 ve Q4_K_M adaylarını üretir. Her aday kısa bir Türkçe llama-tts smoke testi geçmeden ZIP artifact olarak yayımlanmaz. Smoke testi kalite kabulü değildir; gerçek telefon dinleme testi ayrı kanıttır.
+
+Model ZIP'i APK sürümünden bağımsızdır; uygulama güncellenirken mevcut current model dizini korunur.
