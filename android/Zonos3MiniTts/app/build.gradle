@@ -8,6 +8,7 @@ if (!llamaCppDir) {
 android {
     namespace 'com.osman.zonos3tts'
     compileSdk 35
+    ndkVersion '28.0.13004108'
 
     defaultConfig {
         applicationId 'com.osman.zonos3tts'
