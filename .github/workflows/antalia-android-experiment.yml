@@ -76,18 +76,40 @@ jobs:
       - name: Restore stable APK signing identity
         shell: bash
         env:
+          ANDROID_SIGNING_KEY: ${{ secrets.ANDROID_SIGNING_KEY }}
+          ANDROID_SIGNING_KEY_ALIAS: ${{ secrets.ANDROID_SIGNING_KEY_ALIAS }}
+          ANDROID_SIGNING_KEY_STORE_PASSWORD: ${{ secrets.ANDROID_SIGNING_KEY_STORE_PASSWORD }}
           ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
         run: |
           set -euo pipefail
-          if [[ -z "${ANDROID_KEYSTORE_B64:-}" ]]; then
-            echo "::error::ANDROID_KEYSTORE_B64 Actions secret is missing."
+          KEYSTORE="${RUNNER_TEMP}/antalia-ci.keystore"
+          if [[ -n "${ANDROID_SIGNING_KEY:-}" ]]; then
+            test -n "${ANDROID_SIGNING_KEY_ALIAS:-}"
+            test -n "${ANDROID_SIGNING_KEY_STORE_PASSWORD:-}"
+            printf '%s' "$ANDROID_SIGNING_KEY" | base64 --decode > "$KEYSTORE"
+            KEY_ALIAS="$ANDROID_SIGNING_KEY_ALIAS"
+            STORE_PASS="$ANDROID_SIGNING_KEY_STORE_PASSWORD"
+            KEY_PASS="$ANDROID_SIGNING_KEY_STORE_PASSWORD"
+            SOURCE="standard"
+          elif [[ -n "${ANDROID_KEYSTORE_B64:-}" ]]; then
+            printf '%s' "$ANDROID_KEYSTORE_B64" | base64 --decode > "$KEYSTORE"
+            KEY_ALIAS="ci"
+            STORE_PASS="android"
+            KEY_PASS="android"
+            SOURCE="antalia"
+          else
+            echo "::error::No stable Android signing secret is configured."
             exit 1
           fi
-          KEYSTORE="${RUNNER_TEMP}/antalia-ci.keystore"
-          printf '%s' "$ANDROID_KEYSTORE_B64" | base64 --decode > "$KEYSTORE"
           chmod 600 "$KEYSTORE"
-          keytool -list -keystore "$KEYSTORE" -storepass android -alias ci >/dev/null
-          echo "ANTALIA_KEYSTORE_PATH=$KEYSTORE" >> "$GITHUB_ENV"
+          keytool -list -keystore "$KEYSTORE" -storepass "$STORE_PASS" -alias "$KEY_ALIAS" >/dev/null
+          echo "Stable signing source: $SOURCE"
+          {
+            echo "ANTALIA_KEYSTORE_PATH=$KEYSTORE"
+            echo "ANTALIA_KEY_ALIAS=$KEY_ALIAS"
+            echo "ANTALIA_KEYSTORE_PASSWORD=$STORE_PASS"
+            echo "ANTALIA_KEY_PASSWORD=$KEY_PASS"
+          } >> "$GITHUB_ENV"
 
       - name: Build and test compact ARM64 R8 release APK
         shell: bash

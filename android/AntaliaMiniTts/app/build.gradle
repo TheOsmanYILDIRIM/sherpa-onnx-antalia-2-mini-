@@ -18,9 +18,9 @@ android {
             def keystorePath = System.getenv('ANTALIA_KEYSTORE_PATH')
             if (keystorePath) {
                 storeFile file(keystorePath)
-                storePassword 'android'
-                keyAlias 'ci'
-                keyPassword 'android'
+                storePassword System.getenv('ANTALIA_KEYSTORE_PASSWORD')
+                keyAlias System.getenv('ANTALIA_KEY_ALIAS')
+                keyPassword System.getenv('ANTALIA_KEY_PASSWORD')
             }
         }
     }
