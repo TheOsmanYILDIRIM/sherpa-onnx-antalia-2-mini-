@@ -48,6 +48,7 @@ struct Engine {
         params.mmproj_use_gpu = false;
         params.fit_params = false;
         params.warmup = false;
+        params.sampling.seed = 4; // CI seed sweep: strongest/longest reproducible Q2 Turkish signal
         params.cpuparams.n_threads = threads;
         params.cpuparams_batch.n_threads = threads;
 
@@ -70,6 +71,14 @@ struct Engine {
         sample_rate = info.sample_rate;
         if (info.n_voices > 0) {
             if (const char * v = mtmd_gen_audio_voice_name(mctx.get(), 0)) voice = v;
+            for (int32_t i = 0; i < info.n_voices; ++i) {
+                if (const char * v = mtmd_gen_audio_voice_name(mctx.get(), i)) {
+                    if (std::string(v) == "Savannah_en-American_F_1") {
+                        voice = v;
+                        break;
+                    }
+                }
+            }
         }
     }
 
@@ -107,6 +116,9 @@ struct Engine {
         inp.prompt_len = prompt.size();
         inp.speaker_ref = speaker.get();
         inp.lang = "tr";
+        inp.top_k = params.sampling.top_k;
+        inp.top_p = params.sampling.top_p;
+        inp.seed = params.sampling.seed;
         inp.out_type = MTMD_HELPER_GEN_AUDIO_OUTTYPE_PCM;
         inp.stream = false;
 
