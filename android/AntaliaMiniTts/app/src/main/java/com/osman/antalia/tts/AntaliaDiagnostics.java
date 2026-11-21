@@ -84,8 +84,12 @@ final class AntaliaDiagnostics {
         if (data == null || data.length == 0) return new byte[0];
         if (maxBytes <= 0 || data.length <= maxBytes) return data.clone();
         int start = data.length - maxBytes;
-        while (start < data.length && data[start] != (byte)'\n') start++;
-        if (start < data.length) start++;
+        // Keep an exact line boundary. Only discard bytes when the requested
+        // window starts in the middle of a line.
+        if (start > 0 && data[start - 1] != (byte)'\n') {
+            while (start < data.length && data[start] != (byte)'\n') start++;
+            if (start < data.length) start++;
+        }
         int length = Math.max(0, data.length - start);
         byte[] tail = new byte[length];
         System.arraycopy(data, start, tail, 0, length);
