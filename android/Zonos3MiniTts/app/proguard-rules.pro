@@ -1,0 +1,1 @@
+-keep class com.osman.zonos3tts.ZonosNative { *; }

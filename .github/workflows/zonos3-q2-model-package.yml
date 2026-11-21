@@ -1,0 +1,118 @@
+name: ZONOS3 Mini Q2 external model ZIPs
+
+on:
+  push:
+    branches:
+      - experiment/zonos3-mini-android-q2-20261121
+    paths:
+      - .github/workflows/zonos3-q2-model-package.yml
+      - android/Zonos3MiniTts/**
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build pinned llama.cpp quantizer and TTS
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/ggml-org/llama.cpp "$RUNNER_TEMP/llama.cpp"
+          git -C "$RUNNER_TEMP/llama.cpp" checkout e6d624b9a4b95c6b52f5ca384d70b75581f9821a
+          cmake -S "$RUNNER_TEMP/llama.cpp" -B "$RUNNER_TEMP/llama-build" -DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_EXAMPLES=OFF -DLLAMA_BUILD_SERVER=OFF -DLLAMA_OPENSSL=OFF -DGGML_NATIVE=OFF
+          cmake --build "$RUNNER_TEMP/llama-build" --target llama-quantize llama-tts -j 2
+
+      - name: Download current Q2 backbone and matching BF16 mmproj
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --disable-pip-version-check "huggingface_hub==0.36.0"
+          mkdir -p "$RUNNER_TEMP/model"
+          python3 - <<'PY'
+          import json, os, shutil
+          from huggingface_hub import HfApi, hf_hub_download
+          repo="prithivMLmods/ZONOS3-Mini-GGUF"
+          info=HfApi().model_info(repo)
+          files={
+              "backbone-q2_k.gguf": ("ZONOS3-Mini.Q2_K.gguf", 299703488),
+              "mmproj-bf16.gguf": ("ZONOS3-Mini.mmproj-bf16.gguf", 688971264),
+          }
+          root=os.path.join(os.environ["RUNNER_TEMP"],"model")
+          for out,(name,expected) in files.items():
+              src=hf_hub_download(repo_id=repo,filename=name,revision=info.sha)
+              assert os.path.getsize(src)==expected,(name,os.path.getsize(src),expected)
+              shutil.copyfile(src,os.path.join(root,out))
+          json.dump({"repo":repo,"revision":info.sha},open(os.path.join(root,"source.json"),"w"),indent=2)
+          print(info.sha)
+          PY
+
+      - name: Quantize mmproj and smoke-test Turkish generation
+        shell: bash
+        run: |
+          set -euo pipefail
+          Q="$RUNNER_TEMP/llama-build/bin/llama-quantize"
+          T="$RUNNER_TEMP/llama-build/bin/llama-tts"
+          M="$RUNNER_TEMP/model"
+          "$Q" "$M/mmproj-bf16.gguf" "$M/mmproj-q8_0.gguf" Q8_0
+          "$Q" "$M/mmproj-bf16.gguf" "$M/mmproj-q4_k_m.gguf" Q4_K_M
+          for q in q8_0 q4_k_m; do
+            "$T" -m "$M/backbone-q2_k.gguf" -mm "$M/mmproj-$q.gguf" --tts-lang tr -p "Merhaba, bu kısa bir Türkçe ses denemesidir." -n 12 -o "$M/smoke-$q.wav"
+            python3 - "$M/smoke-$q.wav" <<'PY'
+          import sys,wave,array,os
+          p=sys.argv[1]
+          assert os.path.getsize(p)>1000,p
+          with wave.open(p,"rb") as w:
+              assert w.getnchannels()==1
+              assert w.getframerate()>16000
+              assert w.getnframes()>100
+              raw=w.readframes(w.getnframes())
+          a=array.array("h");a.frombytes(raw)
+          assert any(x for x in a),"silent output"
+          print(p,os.path.getsize(p))
+          PY
+          done
+
+      - name: Build SHA-verified external ZIP packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib,json,os,shutil,zipfile
+          root=os.path.join(os.environ["RUNNER_TEMP"],"model")
+          src=json.load(open(os.path.join(root,"source.json")))
+          out=os.path.join(os.environ["RUNNER_TEMP"],"packages");os.makedirs(out,exist_ok=True)
+          def sha(p):
+              h=hashlib.sha256()
+              with open(p,"rb") as f:
+                  for b in iter(lambda:f.read(1024*1024),b""):h.update(b)
+              return h.hexdigest()
+          for variant,mm in [("Q2_K+Q8_0","mmproj-q8_0.gguf"),("Q2_K+Q4_K_M","mmproj-q4_k_m.gguf")]:
+              key=variant.replace("+","-").lower()
+              d=os.path.join(out,key);os.makedirs(d)
+              files={"backbone":"backbone-q2_k.gguf","mmproj":mm}
+              manifest={"schema":1,"model_id":"ZONOS3-Mini","variant":variant,"source_repo":src["repo"],"source_revision":src["revision"],"llama_cpp_revision":"e6d624b9a4b95c6b52f5ca384d70b75581f9821a","files":{}}
+              for role,name in files.items():
+                  source=os.path.join(root,name);dest=os.path.join(d,name);shutil.copyfile(source,dest)
+                  manifest["files"][role]={"name":name,"size":os.path.getsize(dest),"sha256":sha(dest)}
+              with open(os.path.join(d,"zonos3-package.json"),"w") as f:json.dump(manifest,f,ensure_ascii=False,indent=2)
+              zpath=os.path.join(out,"zonos3-mini-android-"+key+".zip")
+              with zipfile.ZipFile(zpath,"w",compression=zipfile.ZIP_STORED) as z:
+                  for name in ["zonos3-package.json",files["backbone"],files["mmproj"]]: z.write(os.path.join(d,name),name)
+              with zipfile.ZipFile(zpath) as z: assert z.testzip() is None
+              print(zpath,os.path.getsize(zpath))
+          PY
+          ls -lh "$RUNNER_TEMP/packages"/*.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zonos3-mini-android-q2-model-zips
+          path: ${{ runner.temp }}/packages/*.zip
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30

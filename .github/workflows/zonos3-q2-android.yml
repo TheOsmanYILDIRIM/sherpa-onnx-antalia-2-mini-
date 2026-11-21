@@ -1,0 +1,78 @@
+name: ZONOS3 Mini Q2 Android ARM64 external model app
+
+on:
+  push:
+    branches:
+      - experiment/zonos3-mini-android-q2-20261121
+    paths:
+      - android/Zonos3MiniTts/**
+      - .github/workflows/zonos3-q2-android.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  android:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pin llama.cpp with ZONOS3 libmtmd support
+        shell: bash
+        run: |
+          set -euo pipefail
+          git clone --filter=blob:none https://github.com/ggml-org/llama.cpp android/Zonos3MiniTts/llama.cpp
+          git -C android/Zonos3MiniTts/llama.cpp checkout e6d624b9a4b95c6b52f5ca384d70b75581f9821a
+          test "$(git -C android/Zonos3MiniTts/llama.cpp rev-parse HEAD)" = e6d624b9a4b95c6b52f5ca384d70b75581f9821a
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - name: Install Android SDK pieces
+        shell: bash
+        run: |
+          set -euo pipefail
+          sdkmanager --install "platforms;android-35" "build-tools;35.0.0" "ndk;28.0.13004108" "cmake;3.22.1"
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: '8.7'
+
+      - name: Unit test and build release APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle -p android/Zonos3MiniTts :app:testReleaseUnitTest :app:assembleRelease --stacktrace --no-daemon
+
+      - name: Verify APK has runtime but no model
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile
+          apks=list(Path("android/Zonos3MiniTts/app/build/outputs/apk/release").glob("*.apk"))
+          assert len(apks)==1,apks
+          apk=apks[0]
+          with ZipFile(apk) as z:
+              assert z.testzip() is None
+              names=z.namelist()
+              assert not any(n.lower().endswith(".gguf") for n in names)
+              libs=[n for n in names if n.startswith("lib/") and n.endswith(".so")]
+              assert libs, "no JNI libraries"
+              assert any(n.endswith("/libzonos3_jni.so") for n in libs), libs
+              abis={n.split("/")[1] for n in libs}
+              assert abis=={"arm64-v8a"},abis
+          print(apk, apk.stat().st_size)
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zonos3-mini-q2-external-model-arm64-apk
+          path: android/Zonos3MiniTts/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+          retention-days: 30
