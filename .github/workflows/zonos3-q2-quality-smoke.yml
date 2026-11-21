@@ -15,33 +15,46 @@ permissions:
 jobs:
   turkish-smoke:
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    timeout-minutes: 35
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download verified smallest model artifact
+      - name: Download verified Q2 Q3 Q8 model packages
         shell: bash
         run: |
           set -euo pipefail
-          run_id="$(gh run list             --repo "$GITHUB_REPOSITORY"             --workflow "ZONOS3 Mini Q2 publish smallest model ZIP"             --branch "experiment/zonos3-mini-android-q2-20261121"             --status success             --limit 1             --json databaseId             --jq '.[0].databaseId')"
+          run_id="$(gh run list             --repo "$GITHUB_REPOSITORY"             --workflow "ZONOS3 Mini Q2 external model ZIPs"             --branch "experiment/zonos3-mini-android-q2-20261121"             --status success             --limit 1             --json databaseId             --jq '.[0].databaseId')"
           test -n "$run_id"
           mkdir -p "$RUNNER_TEMP/in"
-          gh run download "$run_id"             --repo "$GITHUB_REPOSITORY"             --name zonos3-mini-android-q2-q2-smallest-model             --dir "$RUNNER_TEMP/in"
-          mkdir -p "$RUNNER_TEMP/model"
-          unzip -q "$RUNNER_TEMP/in/zonos3-mini-android-q2_k-q2_k.zip" -d "$RUNNER_TEMP/model"
+          gh run download "$run_id"             --repo "$GITHUB_REPOSITORY"             --name zonos3-mini-android-q2-model-zips             --dir "$RUNNER_TEMP/in"
+
           python3 - <<'PY'
-          import json,hashlib,os
+          import hashlib,json,os,zipfile
           from pathlib import Path
-          root=Path(os.environ["RUNNER_TEMP"])/"model"
-          m=json.loads((root/"zonos3-package.json").read_text())
-          assert m["variant"]=="Q2_K+Q2_K"
-          for x in m["files"].values():
-              p=root/x["name"]
-              h=hashlib.sha256(p.read_bytes()).hexdigest()
-              assert p.stat().st_size==x["size"] and h==x["sha256"]
-          print(m["variant"])
+          src=Path(os.environ["RUNNER_TEMP"])/"in"
+          dst=Path(os.environ["RUNNER_TEMP"])/"models"; dst.mkdir()
+          report=json.loads((src/"report.json").read_text())
+          wanted={"Q2_K+Q2_K":"q2","Q2_K+Q3_K_M":"q3","Q2_K+Q8_0":"q8"}
+          for row in report:
+              if row["variant"] not in wanted: continue
+              key=wanted[row["variant"]]
+              z=src/row["zip"]
+              assert z.stat().st_size==row["zip_size"]
+              root=dst/key; root.mkdir()
+              with zipfile.ZipFile(z) as f:
+                  assert f.testzip() is None
+                  f.extractall(root)
+              m=json.loads((root/"zonos3-package.json").read_text())
+              for x in m["files"].values():
+                  p=root/x["name"]
+                  h=hashlib.sha256()
+                  with p.open("rb") as fh:
+                      for b in iter(lambda:fh.read(1024*1024),b""): h.update(b)
+                  assert p.stat().st_size==x["size"] and h.hexdigest()==x["sha256"]
+              print(key,row["variant"],row["zip_size"])
+          assert {p.name for p in dst.iterdir()}=={"q2","q3","q8"}
           PY
 
       - name: Build pinned llama-tts
@@ -53,40 +66,59 @@ jobs:
           cmake -S "$RUNNER_TEMP/llama.cpp" -B "$RUNNER_TEMP/llama-build"             -DCMAKE_BUILD_TYPE=Release -DLLAMA_BUILD_TOOLS=ON -DLLAMA_BUILD_EXAMPLES=OFF             -DLLAMA_BUILD_SERVER=OFF -DLLAMA_OPENSSL=OFF -DGGML_NATIVE=OFF
           cmake --build "$RUNNER_TEMP/llama-build" --target llama-tts -j 2
 
-      - name: Generate longer Turkish sample and measure
+      - name: Compare long Turkish synthesis
         shell: bash
         run: |
           set -euo pipefail
-          M="$RUNNER_TEMP/model"
-          O="$RUNNER_TEMP/out"
-          mkdir -p "$O"
-          /usr/bin/time -v "$RUNNER_TEMP/llama-build/bin/llama-tts"             -m "$M/backbone-q2_k.gguf"             -mm "$M/mmproj-q2_k.gguf"             --tts-lang tr             --tts-voice Savannah_en-American_F_1             -p "Merhaba. Bu, ZONOS üç Mini modelinin Android için küçültülmüş Q2 denemesidir. Türkçe cümlelerin anlaşılır ve doğal kalıp kalmadığını dinleyerek kontrol ediyoruz."             -n 180             -o "$O/zonos3-mini-q2-turkish-smoke.wav"             >"$O/tts.log" 2>"$O/time-and-stderr.log"
+          T="$RUNNER_TEMP/llama-build/bin/llama-tts"
+          O="$RUNNER_TEMP/out"; mkdir -p "$O"
+          TEXT="Merhaba. Bu, ZONOS üç Mini modelinin Android için küçültülmüş sürümlerini karşılaştırdığımız bir Türkçe ses denemesidir. Amacımız küçük model boyutunda cümlelerin anlaşılır, akıcı ve mümkün olduğunca doğal kalıp kalmadığını kontrol etmektir."
+
+          for q in q2 q3 q8; do
+            M="$RUNNER_TEMP/models/$q"
+            MM="$(find "$M" -maxdepth 1 -name 'mmproj-*.gguf' -print -quit)"
+            echo "::group::$q"
+            /usr/bin/time -f 'elapsed_s=%e\nmax_rss_kb=%M' -o "$O/time-$q.txt"               "$T" -m "$M/backbone-q2_k.gguf" -mm "$MM"               --tts-lang tr --tts-voice Savannah_en-American_F_1               -p "$TEXT" -n 300 -o "$O/turkish-$q.wav"               >"$O/tts-$q.log" 2>"$O/stderr-$q.log"
+            cat "$O/time-$q.txt"
+            tail -30 "$O/tts-$q.log" || true
+            tail -30 "$O/stderr-$q.log" || true
+            echo "::endgroup::"
+          done
+
           python3 - <<'PY'
           import array,json,math,os,wave
           from pathlib import Path
-          p=Path(os.environ["RUNNER_TEMP"])/"out"/"zonos3-mini-q2-turkish-smoke.wav"
-          with wave.open(str(p),"rb") as w:
-              rate=w.getframerate(); frames=w.getnframes(); channels=w.getnchannels()
-              raw=w.readframes(frames)
-          assert channels==1 and rate==44100 and frames>rate
-          a=array.array("h");a.frombytes(raw)
-          rms=math.sqrt(sum(x*x for x in a)/len(a))
-          peak=max(abs(x) for x in a)
-          assert rms>20 and peak>100
-          result={"sample_rate":rate,"frames":frames,"duration_s":frames/rate,"rms_pcm16":rms,"peak_pcm16":peak,"wav_bytes":p.stat().st_size}
-          (p.parent/"validation.json").write_text(json.dumps(result,indent=2)+"\n")
-          print(json.dumps(result,indent=2))
+          root=Path(os.environ["RUNNER_TEMP"])/"out"
+          rows=[]
+          for q in ("q2","q3","q8"):
+              p=root/f"turkish-{q}.wav"
+              with wave.open(str(p),"rb") as w:
+                  rate=w.getframerate(); frames=w.getnframes(); channels=w.getnchannels()
+                  raw=w.readframes(frames)
+              a=array.array("h"); a.frombytes(raw)
+              rms=math.sqrt(sum(x*x for x in a)/len(a)) if a else 0
+              peak=max((abs(x) for x in a),default=0)
+              metrics={}
+              for line in (root/f"time-{q}.txt").read_text().splitlines():
+                  if "=" in line:
+                      k,v=line.split("=",1); metrics[k]=float(v)
+              row={"variant":q,"sample_rate":rate,"channels":channels,"frames":frames,
+                   "duration_s":frames/rate if rate else 0,"rms_pcm16":rms,"peak_pcm16":peak,
+                   "wav_bytes":p.stat().st_size,**metrics}
+              assert channels==1 and rate==44100 and frames>100 and rms>20 and peak>100,row
+              rows.append(row)
+          (root/"comparison.json").write_text(json.dumps(rows,indent=2)+"\n")
+          print(json.dumps(rows,indent=2))
           PY
-          cat "$O/time-and-stderr.log"
-          cat "$O/tts.log"
 
       - uses: actions/upload-artifact@v4
         with:
-          name: zonos3-mini-q2-turkish-quality-smoke
+          name: zonos3-mini-turkish-q2-q3-q8-comparison
           path: |
-            ${{ runner.temp }}/out/zonos3-mini-q2-turkish-smoke.wav
-            ${{ runner.temp }}/out/validation.json
-            ${{ runner.temp }}/out/time-and-stderr.log
-            ${{ runner.temp }}/out/tts.log
+            ${{ runner.temp }}/out/*.wav
+            ${{ runner.temp }}/out/*.json
+            ${{ runner.temp }}/out/time-*.txt
+            ${{ runner.temp }}/out/tts-*.log
+            ${{ runner.temp }}/out/stderr-*.log
           if-no-files-found: error
           retention-days: 30
