@@ -1,0 +1,69 @@
+name: ZONOS3 Mini Q2 publish smallest model ZIP
+
+on:
+  push:
+    branches:
+      - experiment/zonos3-mini-android-q2-20261121
+    paths:
+      - .github/workflows/zonos3-q2-publish-smallest.yml
+  workflow_dispatch:
+
+permissions:
+  actions: read
+  contents: read
+
+jobs:
+  publish-smallest:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download latest verified model package artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_id="$(gh run list             --repo "$GITHUB_REPOSITORY"             --workflow "ZONOS3 Mini Q2 external model ZIPs"             --branch "experiment/zonos3-mini-android-q2-20261121"             --status success             --limit 1             --json databaseId             --jq '.[0].databaseId')"
+          test -n "$run_id"
+          echo "source_run=$run_id" >> "$GITHUB_ENV"
+          mkdir -p "$RUNNER_TEMP/source"
+          gh run download "$run_id"             --repo "$GITHUB_REPOSITORY"             --name zonos3-mini-android-q2-model-zips             --dir "$RUNNER_TEMP/source"
+
+      - name: Verify and select Q2_K + Q2_K package
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import json, os, zipfile
+          from pathlib import Path
+          root=Path(os.environ["RUNNER_TEMP"])/"source"
+          report=json.loads((root/"report.json").read_text())
+          wanted=next(x for x in report if x["variant"]=="Q2_K+Q2_K")
+          z=root/wanted["zip"]
+          assert z.is_file() and z.stat().st_size==wanted["zip_size"],(z,wanted)
+          with zipfile.ZipFile(z) as f:
+              assert f.testzip() is None
+              names=set(f.namelist())
+              assert "zonos3-package.json" in names
+              m=json.loads(f.read("zonos3-package.json"))
+              assert m["variant"]=="Q2_K+Q2_K"
+              assert m["files"]["backbone"]["size"]==wanted["backbone_size"]
+              assert m["files"]["mmproj"]["size"]==wanted["mmproj_size"]
+          out=Path(os.environ["RUNNER_TEMP"])/"smallest"
+          out.mkdir()
+          (out/z.name).write_bytes(z.read_bytes())
+          (out/"report.json").write_text(json.dumps(wanted,indent=2)+"\n")
+          print(json.dumps(wanted,indent=2))
+          PY
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: zonos3-mini-android-q2-q2-smallest-model
+          path: |
+            ${{ runner.temp }}/smallest/zonos3-mini-android-q2_k-q2_k.zip
+            ${{ runner.temp }}/smallest/report.json
+          if-no-files-found: error
+          compression-level: 0
+          retention-days: 30
