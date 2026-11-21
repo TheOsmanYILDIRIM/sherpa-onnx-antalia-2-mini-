@@ -97,3 +97,15 @@ service also returns START_STICKY while protection is enabled so Android may rec
 after ordinary process death. Explicitly turning the switch off or using the notification's
 **Arka planı kapat** action clears the saved choice. Android force-stop, reboot/OEM policy
 and denied notification permission are still platform-controlled and are not bypassed.
+
+
+## Android TTS STOPPED handling
+
+Rolling diagnostics exposed a real downstream cancellation: Android's
+`SynthesisCallback.audioAvailable()` can return `STOPPED` as well as `ERROR`.
+The engine previously collapsed both into `callback.error()`, which could make a
+reader interpret a normal queue cancellation/flush as a synthesis failure and retry
+from an earlier position. STOPPED is now logged separately as `client_stopped`,
+acknowledged with `done()`, and never converted into a synthesis error. Genuine
+delivery errors still report `ERROR_OUTPUT`. This preserves the Android TTS protocol
+while keeping the diagnostic distinction explicit.

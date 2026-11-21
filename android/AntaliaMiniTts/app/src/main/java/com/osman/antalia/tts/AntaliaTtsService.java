@@ -13,6 +13,7 @@ import java.util.Collections;
 import java.util.List;
 import java.util.Locale;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /** Android system TextToSpeech engine, not a stand-alone playback-only demo. */
 public final class AntaliaTtsService extends TextToSpeechService {
@@ -87,7 +88,7 @@ public final class AntaliaTtsService extends TextToSpeechService {
         final long[] firstAudioNs = {-1};
         final long[] totalFrames = {0};
         final int[] callbackPackets = {0};
-        final AtomicBoolean consumerFailed = new AtomicBoolean(false);
+        final AtomicInteger deliveryStatus = new AtomicInteger(TextToSpeech.SUCCESS);
         String outcome = "unknown";
         try {
             if (onIsLanguageAvailable(request.getLanguage(), request.getCountry(),
@@ -144,11 +145,14 @@ public final class AntaliaTtsService extends TextToSpeechService {
                     int length = Math.min(max, bytes.length - offset);
                     // Timestamp before callback; the downstream player may block here.
                     if (firstAudioNs[0] < 0) firstAudioNs[0] = SystemClock.elapsedRealtimeNanos();
-                    if (callback.audioAvailable(bytes, offset, length) != TextToSpeech.SUCCESS) {
-                        AntaliaDiagnostics.event(this, "tts_audio_rejected",
+                    int status = callback.audioAvailable(bytes, offset, length);
+                    if (status != TextToSpeech.SUCCESS) {
+                        deliveryStatus.compareAndSet(TextToSpeech.SUCCESS, status);
+                        AntaliaDiagnostics.event(this,
+                            status == TextToSpeech.STOPPED
+                                ? "tts_audio_client_stopped" : "tts_audio_delivery_error",
                             "request=" + sequence + " packet=" + callbackPackets[0]
-                                + " bytes=" + length);
-                        consumerFailed.set(true);
+                                + " bytes=" + length + " status=" + status);
                         stop.set(true);
                         return false;
                     }
@@ -162,16 +166,30 @@ public final class AntaliaTtsService extends TextToSpeechService {
                 "request=" + sequence + " packets=" + callbackPackets[0]
                     + " frames=" + totalFrames[0] + " stopped=" + stop.get()
                     + " profile=" + core.lastProfile());
-            if (consumerFailed.get()) {
-                callback.error();
-                outcome = "audio_delivery_failed";
+            int finalDeliveryStatus = deliveryStatus.get();
+            if (finalDeliveryStatus == TextToSpeech.STOPPED) {
+                // The client/framework cancelled this utterance. This is not a
+                // synthesis failure: converting STOPPED into callback.error()
+                // makes reader apps legitimately treat a queue flush/cancel as
+                // an engine error and can trigger a retry from an earlier point.
+                int doneStatus = callback.done();
+                AntaliaDiagnostics.event(this, "tts_client_stop_ack",
+                    "request=" + sequence + " doneStatus=" + doneStatus
+                        + " packets=" + callbackPackets[0]);
+                outcome = "client_stopped";
+            } else if (finalDeliveryStatus != TextToSpeech.SUCCESS) {
+                callback.error(TextToSpeech.ERROR_OUTPUT);
+                callback.done();
+                outcome = "audio_delivery_error";
             } else if (!stop.get() && callbackPackets[0] == 0) {
-                callback.error();
+                callback.error(TextToSpeech.ERROR_SYNTHESIS);
+                callback.done();
                 outcome = "no_audio";
             } else if (!stop.get()) {
                 callback.done();
                 outcome = "done";
             } else {
+                callback.done();
                 outcome = "cancelled";
             }
         } catch (Exception e) {
