@@ -61,7 +61,9 @@ jobs:
           M="$RUNNER_TEMP/model"
           "$Q" "$M/mmproj-bf16.gguf" "$M/mmproj-q8_0.gguf" Q8_0
           "$Q" "$M/mmproj-bf16.gguf" "$M/mmproj-q4_k_m.gguf" Q4_K_M
-          for q in q8_0 q4_k_m; do
+          "$Q" "$M/mmproj-bf16.gguf" "$M/mmproj-q3_k_m.gguf" Q3_K_M
+          "$Q" "$M/mmproj-bf16.gguf" "$M/mmproj-q2_k.gguf" Q2_K
+          for q in q8_0 q4_k_m q3_k_m q2_k; do
             "$T" -m "$M/backbone-q2_k.gguf" -mm "$M/mmproj-$q.gguf" --tts-lang tr -p "Merhaba, bu kısa bir Türkçe ses denemesidir." -n 12 -o "$M/smoke-$q.wav"
             python3 - "$M/smoke-$q.wav" <<'PY'
           import sys,wave,array,os
@@ -92,7 +94,7 @@ jobs:
               with open(p,"rb") as f:
                   for b in iter(lambda:f.read(1024*1024),b""):h.update(b)
               return h.hexdigest()
-          for variant,mm in [("Q2_K+Q8_0","mmproj-q8_0.gguf"),("Q2_K+Q4_K_M","mmproj-q4_k_m.gguf")]:
+          for variant,mm in [("Q2_K+Q8_0","mmproj-q8_0.gguf"),("Q2_K+Q4_K_M","mmproj-q4_k_m.gguf"),("Q2_K+Q3_K_M","mmproj-q3_k_m.gguf"),("Q2_K+Q2_K","mmproj-q2_k.gguf")]:
               key=variant.replace("+","-").lower()
               d=os.path.join(out,key);os.makedirs(d)
               files={"backbone":"backbone-q2_k.gguf","mmproj":mm}
