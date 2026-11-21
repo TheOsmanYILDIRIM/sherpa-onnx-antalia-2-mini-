@@ -29,6 +29,8 @@ public final class AntaliaBackgroundService extends Service {
     static final String EXTRA_TEXT = "text";
     static final String EXTRA_STEPS = "steps";
     static final String EXTRA_THREADS = "threads";
+    static final String PREFS = "antalia_settings";
+    static final String PREF_GUARD = "keep_alive";
     private static final String CHANNEL = "antalia_reading";
     private static final int NOTIFICATION = 1011;
     private static volatile boolean running, guardActive;
@@ -41,12 +43,21 @@ public final class AntaliaBackgroundService extends Service {
     private boolean indefiniteLock;
 
     static boolean isGuardActive() { return running && guardActive; }
+    static boolean isGuardEnabled(Context context) {
+        return context.getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(PREF_GUARD, false);
+    }
+    static void setGuardEnabled(Context context, boolean enabled) {
+        context.getSharedPreferences(PREFS, MODE_PRIVATE).edit().putBoolean(PREF_GUARD, enabled).apply();
+    }
     static Intent command(Context context, String action) {
         return new Intent(context, AntaliaBackgroundService.class).setAction(action);
     }
     @Override public void onCreate() {
         super.onCreate();
         running = true;
+        protect = isGuardEnabled(this);
+        AntaliaDiagnostics.event(this, "background_create",
+            "persistedGuard=" + protect);
         NotificationManager manager = (NotificationManager)getSystemService(NOTIFICATION_SERVICE);
         manager.createNotificationChannel(new NotificationChannel(CHANNEL,
             "Antalia arka plan seslendirme", NotificationManager.IMPORTANCE_LOW));
@@ -101,6 +112,9 @@ public final class AntaliaBackgroundService extends Service {
     }
     private void refreshOrStop() {
         guardActive = protect;
+        AntaliaDiagnostics.event(this, "background_state",
+            "guard=" + protect + " reading=" + reading
+                + " wakeHeld=" + (wakeLock != null && wakeLock.isHeld()));
         if (protect || reading) {
             enterForeground();
             refreshWakeLock();
@@ -110,27 +124,50 @@ public final class AntaliaBackgroundService extends Service {
             stopSelf();
         }
     }
+    private void preloadAsync() {
+        executor.execute(() -> {
+            try {
+                int steps = getSharedPreferences(PREFS, MODE_PRIVATE)
+                    .getBoolean("fast", true) ? 4 : 8;
+                int threads = getSharedPreferences(PREFS, MODE_PRIVATE)
+                    .getInt("threads", 4);
+                AntaliaDiagnostics.event(this, "background_preload_begin",
+                    "steps=" + steps + " threads=" + threads);
+                AntaliaCore.shared(this).prepare(steps, threads);
+                AntaliaDiagnostics.event(this, "background_preload_done",
+                    "steps=" + steps + " threads=" + threads);
+            } catch (Exception e) {
+                AntaliaDiagnostics.exception(this, "background_preload_error",
+                    "model preload", e);
+                Log.w("AntaliaBackground", "Background TTS preload failed", e);
+            }
+        });
+    }
     @Override public int onStartCommand(Intent intent, int flags, int startId) {
         String action = intent == null ? null : intent.getAction();
-        if (action == null) { stopSelf(startId); return START_NOT_STICKY; }
+        AntaliaDiagnostics.event(this, "background_command",
+            "action=" + action + " flags=" + flags + " startId=" + startId
+                + " persistedGuard=" + isGuardEnabled(this));
+        if (action == null) {
+            if (isGuardEnabled(this)) {
+                protect = true;
+                refreshOrStop();
+                preloadAsync();
+                return START_STICKY;
+            }
+            stopSelf(startId);
+            return START_NOT_STICKY;
+        }
         switch (action) {
             case ACTION_GUARD_ON:
                 protect = true;
+                setGuardEnabled(this, true);
                 refreshOrStop();
-                executor.execute(() -> {
-                    try {
-                        int steps = getSharedPreferences("antalia_settings", MODE_PRIVATE)
-                            .getBoolean("fast", true) ? 4 : 8;
-                        int threads = getSharedPreferences("antalia_settings", MODE_PRIVATE)
-                            .getInt("threads", 4);
-                        AntaliaCore.shared(this).prepare(steps, threads);
-                    } catch (Exception e) {
-                        Log.w("AntaliaBackground", "Background TTS preload failed", e);
-                    }
-                });
+                preloadAsync();
                 break;
             case ACTION_GUARD_OFF:
                 protect = false;
+                setGuardEnabled(this, false);
                 refreshOrStop();
                 break;
             case ACTION_READ:
@@ -151,6 +188,7 @@ public final class AntaliaBackgroundService extends Service {
                 break;
             case ACTION_STOP_ALL:
                 protect = false;
+                setGuardEnabled(this, false);
                 cancelCurrent();
                 reading = false;
                 refreshOrStop();
@@ -159,7 +197,7 @@ public final class AntaliaBackgroundService extends Service {
                 stopSelf(startId);
                 break;
         }
-        return START_NOT_STICKY; // No reboot or process-death auto-resurrection.
+        return protect ? START_STICKY : START_NOT_STICKY;
     }
     private static byte[] pcm16(float[] samples) {
         byte[] pcm = new byte[samples.length * 2];
@@ -192,6 +230,8 @@ public final class AntaliaBackgroundService extends Service {
         }
     }
     private void readAsync(String speech, int steps, int threads) {
+        AntaliaDiagnostics.event(this, "background_read_begin",
+            "chars=" + speech.length() + " steps=" + steps + " threads=" + threads);
         cancelled.set(true);
         AtomicBoolean token = new AtomicBoolean();
         cancelled = token;
@@ -209,14 +249,24 @@ public final class AntaliaBackgroundService extends Service {
                     while (at < bytes.length && !token.get()) {
                         int count = Math.min(16384, bytes.length - at);
                         int wrote = output.write(bytes, at, count);
-                        if (wrote <= 0) return false;
+                        if (wrote <= 0) {
+                            AntaliaDiagnostics.event(this, "background_audio_write_failed",
+                                "requested=" + count + " wrote=" + wrote);
+                            return false;
+                        }
                         at += wrote;
                     }
                     return !token.get();
                 });
             } catch (Exception e) {
-                if (!token.get()) Log.e("AntaliaBackground", "Playback failed", e);
+                if (!token.get()) {
+                    AntaliaDiagnostics.exception(this, "background_read_error",
+                        "chars=" + speech.length(), e);
+                    Log.e("AntaliaBackground", "Playback failed", e);
+                }
             } finally {
+                AntaliaDiagnostics.event(this, "background_read_end",
+                    "chars=" + speech.length() + " cancelled=" + token.get());
                 if (out != null) {
                     try { out.stop(); } catch (Exception ignored) {}
                     out.release();
@@ -231,7 +281,15 @@ public final class AntaliaBackgroundService extends Service {
             }
         });
     }
+    @Override public void onTaskRemoved(Intent rootIntent) {
+        AntaliaDiagnostics.event(this, "background_task_removed",
+            "guard=" + protect + " reading=" + reading);
+        super.onTaskRemoved(rootIntent);
+    }
     @Override public void onDestroy() {
+        AntaliaDiagnostics.event(this, "background_destroy",
+            "guard=" + protect + " reading=" + reading
+                + " persistedGuard=" + isGuardEnabled(this));
         running = false;
         guardActive = false;
         cancelCurrent();

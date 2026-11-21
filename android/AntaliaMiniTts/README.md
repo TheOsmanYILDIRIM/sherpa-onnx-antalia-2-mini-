@@ -79,3 +79,21 @@ foreground-service behavior are not changed in this revision.
 Acceptance pending: real Novela and Moon+ Reader listening comparisons with identical
 text and speech rate, screen on/off, and optionally `adb logcat -s
 AntaliaTtsTiming:I` from a connected host. GitHub CI is not a device test.
+
+
+## Rolling diagnostics and persistent keep-alive
+
+The app now keeps a private rolling diagnostic log capped at roughly 128 KB. It records
+process/service lifecycle, Android TTS request boundaries, callback acceptance, first PCM,
+ONNX stage begin/end/timeout/error, chunk retries, wake-lock/background state and final
+outcomes. Utterance/book text is never written. The in-app **Son TTS tanılama kaydını
+paylaş** button exports only the recent tail, so a future stop can be classified as reader
+silence, callback rejection, ONNX-stage stall, explicit stop, service destruction or
+process replacement.
+
+The **Ekran kapalıyken TTS motorunu hazır tut** choice is persisted in SharedPreferences.
+If enabled, reopening the app automatically restores the foreground guard; the guard
+service also returns START_STICKY while protection is enabled so Android may recreate it
+after ordinary process death. Explicitly turning the switch off or using the notification's
+**Arka planı kapat** action clears the saved choice. Android force-stop, reboot/OEM policy
+and denied notification permission are still platform-controlled and are not bypassed.

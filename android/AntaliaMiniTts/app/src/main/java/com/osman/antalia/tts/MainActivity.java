@@ -128,7 +128,7 @@ public final class MainActivity extends Activity {
         keepAlive = new Switch(this);
         keepAlive.setText("Ekran kapalıyken TTS motorunu hazır tut");
         keepAlive.setTextSize(18);
-        keepAlive.setChecked(AntaliaBackgroundService.isGuardActive());
+        keepAlive.setChecked(AntaliaBackgroundService.isGuardEnabled(this));
         page.addView(keepAlive);
         page.addView(title("Termux gibi kalıcı bildirim + işlemci WakeLock kullanır. Açıkken pil tüketimi artabilir. Sistem uygulamayı yine de durdurabilir.",13));
         Button battery = new Button(this);
@@ -142,9 +142,20 @@ public final class MainActivity extends Activity {
                     Uri.parse("package:" + getPackageName())));
             }
         });
+        Button diagnostics = new Button(this);
+        diagnostics.setText("Son TTS tanılama kaydını paylaş");
+        page.addView(diagnostics);
+        page.addView(title("Kayıt en fazla yaklaşık 128 KB tutulur. Kitap/metin içeriği kaydedilmez; yalnız son yaşam döngüsü, süre, ONNX aşaması ve sonuç bilgileri paylaşılır.",13));
+        diagnostics.setOnClickListener(v -> {
+            Intent send = new Intent(Intent.ACTION_SEND);
+            send.setType("text/plain");
+            send.putExtra(Intent.EXTRA_TEXT, AntaliaDiagnostics.snapshot(this));
+            startActivity(Intent.createChooser(send, "Antalia tanılamasını paylaş"));
+        });
         final boolean[] syncingToggle = {false};
         keepAlive.setOnCheckedChangeListener((button, enabled) -> {
             if (syncingToggle[0]) return;
+            AntaliaBackgroundService.setGuardEnabled(this, enabled);
             try {
                 Intent cmd = AntaliaBackgroundService.command(this, enabled
                     ? AntaliaBackgroundService.ACTION_GUARD_ON
@@ -158,9 +169,12 @@ public final class MainActivity extends Activity {
                     message("Arka plan koruması kapalı.");
                 }
             } catch (Exception error) {
+                AntaliaBackgroundService.setGuardEnabled(this, !enabled);
                 syncingToggle[0] = true;
                 keepAlive.setChecked(!enabled);
                 syncingToggle[0] = false;
+                AntaliaDiagnostics.exception(this, "ui_guard_toggle_error",
+                    "enabled=" + enabled, error);
                 message("Arka plan servisi başlatılamadı: " + error.getMessage());
             }
         });
@@ -174,6 +188,7 @@ public final class MainActivity extends Activity {
         page.addView(status);
         page.addView(title("Antalia-2 Mini 1.0.1 · PatientDesk AI · Apache-2.0 · çıkarım ONNX Runtime · geliştirme Sherpa-ONNX forkunda.",12));
         setContentView(scroll);
+        restorePersistentGuard();
         speakButton.setOnClickListener(v -> speak());
         stopButton.setOnClickListener(v -> stopPlayback());
         testButton.setOnClickListener(v -> benchmark());
@@ -196,6 +211,22 @@ public final class MainActivity extends Activity {
             }
         });
     }
+    private void restorePersistentGuard() {
+        if (!AntaliaBackgroundService.isGuardEnabled(this)) return;
+        try {
+            startForegroundService(AntaliaBackgroundService.command(this,
+                AntaliaBackgroundService.ACTION_GUARD_ON));
+            requestNotificationPermission();
+            AntaliaDiagnostics.event(this, "ui_guard_restored", "persistedGuard=true");
+            message("Arka plan koruması önceki ayardan otomatik açıldı.");
+        } catch (Exception error) {
+            AntaliaDiagnostics.exception(this, "ui_guard_restore_error",
+                "persistedGuard=true", error);
+            message("Arka plan koruması kayıtlı, fakat servis şimdi başlatılamadı: "
+                + error.getMessage());
+        }
+    }
+
     private void requestNotificationPermission() {
         if (Build.VERSION.SDK_INT >= 33
             && checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED)

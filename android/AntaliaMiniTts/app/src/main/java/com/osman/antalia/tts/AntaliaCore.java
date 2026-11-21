@@ -300,6 +300,10 @@ final class AntaliaCore implements AutoCloseable {
         final long started = SystemClock.elapsedRealtime();
         final long startSequence = heartbeat.pulse();
         final long noProgressWindowMs = Math.max(1000L, Math.min(3000L, budgetMs / 2L));
+        AntaliaDiagnostics.event(context, "onnx_stage_begin",
+            "stage=" + stage + " attempt=" + (attempt + 1)
+                + " complexity=" + complexity + " budgetMs=" + budgetMs
+                + " baselineUnitUs=" + (baseline == null ? -1L : baseline));
         AtomicBoolean active = new AtomicBoolean(true);
         AtomicBoolean timedOut = new AtomicBoolean(false);
         try (OrtSession.RunOptions runOptions = new OrtSession.RunOptions()) {
@@ -310,10 +314,19 @@ final class AntaliaCore implements AutoCloseable {
                 boolean noProgress = heartbeat.sequence() == startSequence
                     && heartbeat.idleMs() > noProgressWindowMs;
                 boolean timeout = abnormallySlow && noProgress;
-                if (timeout) timedOut.set(true);
+                if (timeout && timedOut.compareAndSet(false, true)) {
+                    AntaliaDiagnostics.event(context, "onnx_stage_timeout",
+                        "stage=" + stage + " attempt=" + (attempt + 1)
+                            + " elapsedMs=" + elapsed + " budgetMs=" + budgetMs
+                            + " idleMs=" + heartbeat.idleMs());
+                }
                 if (timeout || stop.get()) {
                     try { runOptions.setTerminate(true); }
-                    catch (Exception e) { Log.w("AntaliaTtsWatchdog", "Cannot terminate " + stage, e); }
+                    catch (Exception e) {
+                        AntaliaDiagnostics.exception(context, "onnx_terminate_error",
+                            "stage=" + stage + " attempt=" + (attempt + 1), e);
+                        Log.w("AntaliaTtsWatchdog", "Cannot terminate " + stage, e);
+                    }
                 }
             }, 250, 250, TimeUnit.MILLISECONDS);
             try {
@@ -326,8 +339,14 @@ final class AntaliaCore implements AutoCloseable {
                 long elapsed = Math.max(1L, SystemClock.elapsedRealtime() - started);
                 recordHealthyStage(stage, elapsed, complexity);
                 heartbeat.pulse();
+                AntaliaDiagnostics.event(context, "onnx_stage_end",
+                    "stage=" + stage + " attempt=" + (attempt + 1)
+                        + " elapsedMs=" + elapsed + " complexity=" + complexity);
                 return output;
             } catch (Exception e) {
+                AntaliaDiagnostics.exception(context, "onnx_stage_error",
+                    "stage=" + stage + " attempt=" + (attempt + 1)
+                        + " timedOut=" + timedOut.get() + " stopped=" + stop.get(), e);
                 if (timedOut.get()) Log.w("AntaliaTtsWatchdog",
                     "Stage " + stage + " stalled after " + budgetMs + "ms without progress"
                     + " (attempt " + (attempt + 1) + ")", e);
@@ -502,9 +521,15 @@ final class AntaliaCore implements AutoCloseable {
         open(steps,threads);
         Tone tone=new Tone();
         List<String> parts=chunks(raw);
+        AntaliaDiagnostics.event(context, "core_speak_begin",
+            "chars=" + raw.length() + " chunks=" + parts.size()
+                + " steps=" + steps + " threads=" + threads
+                + " speed=" + speed + " addPauses=" + addPauses);
         float[] pendingTail = null;
         for(int i=0;i<parts.size();i++) {
             if(stop.get()||Thread.currentThread().isInterrupted())break;
+            AntaliaDiagnostics.event(context, "core_chunk_begin",
+                "chunk=" + i + "/" + parts.size() + " rawChars=" + parts.get(i).length());
             String cleaned=normalizer.normalize(parts.get(i));
             if(cleaned.isBlank())continue;
             float[] audio = null;
@@ -514,11 +539,20 @@ final class AntaliaCore implements AutoCloseable {
             ProgressHeartbeat heartbeat = new ProgressHeartbeat();
             for (int attempt = 0; attempt < maxAttempts && !stop.get(); attempt++) {
                 try {
+                    AntaliaDiagnostics.event(context, "core_chunk_attempt",
+                        "chunk=" + i + " attempt=" + (attempt + 1) + "/" + maxAttempts
+                            + " normalizedChars=" + cleaned.length());
                     heartbeat.pulse();
                     audio = infer(cleaned, steps, speed, i, stop, fadeOut, attempt, heartbeat);
                     if (audio.length == 0) throw new IllegalStateException("Empty PCM output");
+                    AntaliaDiagnostics.event(context, "core_chunk_infer_done",
+                        "chunk=" + i + " attempt=" + (attempt + 1)
+                            + " samples=" + audio.length + " profile=" + lastProfile);
                     break;
                 } catch (Exception failure) {
+                    AntaliaDiagnostics.exception(context, "core_chunk_attempt_error",
+                        "chunk=" + i + " attempt=" + (attempt + 1)
+                            + " stopped=" + stop.get(), failure);
                     if (stop.get()) throw failure;
                     if (attempt == maxAttempts - 1) throw failure;
                     Log.w("AntaliaTtsWatchdog", "Retrying chunk " + i + " attempt "
@@ -560,6 +594,9 @@ final class AntaliaCore implements AutoCloseable {
             }
         }
         if(!addPauses && pendingTail != null && !stop.get()) sink.deliver(pendingTail);
+        AntaliaDiagnostics.event(context, "core_speak_end",
+            "chars=" + raw.length() + " chunks=" + parts.size() + " stopped=" + stop.get()
+                + " interrupted=" + Thread.currentThread().isInterrupted());
     }
 
     @Override public synchronized void close(){ closeSessions(); }

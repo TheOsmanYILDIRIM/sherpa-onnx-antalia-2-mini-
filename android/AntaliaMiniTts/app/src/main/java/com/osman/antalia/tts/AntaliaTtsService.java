@@ -21,17 +21,24 @@ public final class AntaliaTtsService extends TextToSpeechService {
     // Aggregate only timing and character counts, never the reader's private book text.
     private final java.util.concurrent.atomic.AtomicLong requestSequence = new java.util.concurrent.atomic.AtomicLong();
     private volatile long previousReturnNs;
+    private volatile long activeRequestSequence;
 
     @Override public void onCreate() {
         super.onCreate();
+        AntaliaDiagnostics.event(this, "tts_service_create", "service created");
         core = AntaliaCore.shared(this);
         // Prepare models on a background thread before Android's first synthesis request.
         new Thread(() -> {
             try {
                 int steps = getSharedPreferences("antalia_settings", MODE_PRIVATE).getBoolean("fast", true) ? 4 : 8;
                 int threads = getSharedPreferences("antalia_settings", MODE_PRIVATE).getInt("threads", 4);
+                AntaliaDiagnostics.event(this, "tts_prepare_begin",
+                    "steps=" + steps + " threads=" + threads);
                 core.prepare(steps, threads);
+                AntaliaDiagnostics.event(this, "tts_prepare_done",
+                    "steps=" + steps + " threads=" + threads);
             } catch (Exception e) {
+                AntaliaDiagnostics.exception(this, "tts_prepare_error", "early model initialization", e);
                 android.util.Log.w("AntaliaTtsService", "Early model initialization failed", e);
             }
         }, "antalia-tts-prepare").start();
@@ -69,6 +76,11 @@ public final class AntaliaTtsService extends TextToSpeechService {
         final long gapMs = previousReturnNs == 0 ? -1
             : Math.max(0, (startNs - previousReturnNs) / 1_000_000);
         final boolean terminalPunctuation = speech.trim().matches("(?s).*[.!?…]$");
+        activeRequestSequence = sequence;
+        AntaliaDiagnostics.event(this, "tts_request_begin",
+            "request=" + sequence + " chars=" + speech.length()
+                + " terminalPunctuation=" + terminalPunctuation
+                + " gapFromPreviousMs=" + gapMs);
         final AtomicBoolean stop = new AtomicBoolean();
         cancelled = stop;
         PowerManager.WakeLock lock = null;
@@ -84,11 +96,14 @@ public final class AntaliaTtsService extends TextToSpeechService {
                 outcome = "unsupported_language";
                 return;
             }
-            if (callback.start(AntaliaCore.RATE, AudioFormat.ENCODING_PCM_16BIT, 1)
-                != TextToSpeech.SUCCESS) {
+            int callbackStart = callback.start(AntaliaCore.RATE, AudioFormat.ENCODING_PCM_16BIT, 1);
+            if (callbackStart != TextToSpeech.SUCCESS) {
+                AntaliaDiagnostics.event(this, "tts_callback_start_rejected",
+                    "request=" + sequence + " status=" + callbackStart);
                 outcome = "start_rejected";
                 return;
             }
+            AntaliaDiagnostics.event(this, "tts_callback_started", "request=" + sequence);
             if (speech.trim().isEmpty()) {
                 callback.done();
                 outcome = "empty";
@@ -104,11 +119,18 @@ public final class AntaliaTtsService extends TextToSpeechService {
             PowerManager power = (PowerManager)getSystemService(POWER_SERVICE);
             lock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "antalia:android-tts");
             lock.acquire(10 * 60 * 1000L);
+            AntaliaDiagnostics.event(this, "tts_core_enter",
+                "request=" + sequence + " steps=" + steps + " threads=" + threads
+                    + " speed=" + speed + " wakeLock=true");
             // Readers control pause/continuation between Android TTS requests.
             // Do not inject an additional 60/120 ms silence into every internal chunk.
             core.speak(speech, steps, threads, speed, stop, audio -> {
                 if (stop.get()) return false;
                 int max = Math.min(16000, Math.max(256, callback.getMaxBufferSize()));
+                if (firstAudioNs[0] < 0) {
+                    AntaliaDiagnostics.event(this, "tts_first_pcm",
+                        "request=" + sequence + " frames=" + audio.length + " maxBuffer=" + max);
+                }
                 byte[] bytes = new byte[audio.length * 2];
                 for (int i = 0; i < audio.length; i++) {
                     float f = Float.isFinite(audio[i])
@@ -123,6 +145,9 @@ public final class AntaliaTtsService extends TextToSpeechService {
                     // Timestamp before callback; the downstream player may block here.
                     if (firstAudioNs[0] < 0) firstAudioNs[0] = SystemClock.elapsedRealtimeNanos();
                     if (callback.audioAvailable(bytes, offset, length) != TextToSpeech.SUCCESS) {
+                        AntaliaDiagnostics.event(this, "tts_audio_rejected",
+                            "request=" + sequence + " packet=" + callbackPackets[0]
+                                + " bytes=" + length);
                         consumerFailed.set(true);
                         stop.set(true);
                         return false;
@@ -133,6 +158,10 @@ public final class AntaliaTtsService extends TextToSpeechService {
                 }
                 return !stop.get();
             }, false);
+            AntaliaDiagnostics.event(this, "tts_core_return",
+                "request=" + sequence + " packets=" + callbackPackets[0]
+                    + " frames=" + totalFrames[0] + " stopped=" + stop.get()
+                    + " profile=" + core.lastProfile());
             if (consumerFailed.get()) {
                 callback.error();
                 outcome = "audio_delivery_failed";
@@ -146,6 +175,8 @@ public final class AntaliaTtsService extends TextToSpeechService {
                 outcome = "cancelled";
             }
         } catch (Exception e) {
+            AntaliaDiagnostics.exception(this, "tts_request_error",
+                "request=" + sequence + " stopped=" + stop.get(), e);
             Log.e("AntaliaTtsService", "External TTS synthesis failed", e);
             outcome = "error";
             if (!stop.get()) callback.error();
@@ -164,12 +195,24 @@ public final class AntaliaTtsService extends TextToSpeechService {
                 + " audioMs=" + (totalFrames[0] * 1000 / AntaliaCore.RATE)
                 + " packets=" + callbackPackets[0]
                 + " outcome=" + outcome);
+            AntaliaDiagnostics.event(this, "tts_request_end",
+                "request=" + sequence + " outcome=" + outcome
+                    + " firstPcmMs=" + firstMs + " totalMs=" + elapsedMs
+                    + " audioMs=" + (totalFrames[0] * 1000 / AntaliaCore.RATE)
+                    + " packets=" + callbackPackets[0] + " stopped=" + stop.get());
+            activeRequestSequence = 0;
         }
     }
 
-    @Override protected void onStop() { cancelled.set(true); }
+    @Override protected void onStop() {
+        AntaliaDiagnostics.event(this, "tts_on_stop",
+            "activeRequest=" + activeRequestSequence);
+        cancelled.set(true);
+    }
 
     @Override public void onDestroy() {
+        AntaliaDiagnostics.event(this, "tts_service_destroy",
+            "activeRequest=" + activeRequestSequence);
         cancelled.set(true);
         // Retain model sessions for subsequent service and UI requests in this process.
         super.onDestroy();
