@@ -8,9 +8,21 @@ android {
         applicationId 'com.osman.antalia.tts'
         minSdk 26
         targetSdk 35
-        versionCode 10104
-        versionName '1.0.1-antalia-arm64-r4'
+        versionCode 10105
+        versionName '1.0.1-antalia-arm64-r5'
         ndk { abiFilters 'arm64-v8a' }
+    }
+
+    signingConfigs {
+        stableCi {
+            def keystorePath = System.getenv('ANTALIA_KEYSTORE_PATH')
+            if (keystorePath) {
+                storeFile file(keystorePath)
+                storePassword 'android'
+                keyAlias 'ci'
+                keyPassword 'android'
+            }
+        }
     }
 
     buildTypes {
@@ -20,10 +32,9 @@ android {
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'
         }
         release {
-            // Production-like installable build: R8/resource shrinking enabled and
-            // non-debuggable. CI uses the standard debug signing key only so the
-            // resulting release APK can be sideloaded for device verification.
-            signingConfig signingConfigs.debug
+            // Stable sideload identity: CI decodes the private keystore from the
+            // repository Actions secret into RUNNER_TEMP. The key is never committed.
+            signingConfig signingConfigs.stableCi
             minifyEnabled true
             shrinkResources true
             proguardFiles getDefaultProguardFile('proguard-android-optimize.txt'), 'proguard-rules.pro'

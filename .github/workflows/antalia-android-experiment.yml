@@ -73,10 +73,27 @@ jobs:
         with:
           gradle-version: '8.7'
 
+      - name: Restore stable APK signing identity
+        shell: bash
+        env:
+          ANDROID_KEYSTORE_B64: ${{ secrets.ANDROID_KEYSTORE_B64 }}
+        run: |
+          set -euo pipefail
+          if [[ -z "${ANDROID_KEYSTORE_B64:-}" ]]; then
+            echo "::error::ANDROID_KEYSTORE_B64 Actions secret is missing."
+            exit 1
+          fi
+          KEYSTORE="${RUNNER_TEMP}/antalia-ci.keystore"
+          printf '%s' "$ANDROID_KEYSTORE_B64" | base64 --decode > "$KEYSTORE"
+          chmod 600 "$KEYSTORE"
+          keytool -list -keystore "$KEYSTORE" -storepass android -alias ci >/dev/null
+          echo "ANTALIA_KEYSTORE_PATH=$KEYSTORE" >> "$GITHUB_ENV"
+
       - name: Build and test compact ARM64 R8 release APK
         shell: bash
         run: |
           set -euo pipefail
+          test -f "$ANTALIA_KEYSTORE_PATH"
           gradle -p android/AntaliaMiniTts :app:testReleaseUnitTest :app:assembleRelease --stacktrace --no-daemon
 
       - name: Verify ARM64 APK contains exact four-stage original models
@@ -120,7 +137,7 @@ jobs:
           set -euo pipefail
           APKSIGNER="$ANDROID_HOME/build-tools/35.0.0/apksigner"
           test -x "$APKSIGNER"
-          "$APKSIGNER" verify --verbose android/AntaliaMiniTts/app/build/outputs/apk/release/app-release.apk
+          "$APKSIGNER" verify --verbose --print-certs android/AntaliaMiniTts/app/build/outputs/apk/release/app-release.apk
 
       - name: Upload compact ARM64 R8 release APK
         uses: actions/upload-artifact@v4

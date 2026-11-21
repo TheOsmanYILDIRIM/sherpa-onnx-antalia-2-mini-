@@ -119,3 +119,14 @@ the generic ERROR return. Antalia therefore no longer calls `callback.error()`
 after any non-successful audio delivery. It stops producing PCM and calls `done()`
 so Android preserves and dispatches the callback's existing status. Diagnostics
 record both the `audioStatus` and `doneStatus` for the next incident.
+
+
+## Stable APK signing for in-place updates
+
+The Antalia release build no longer uses Gradle's runner-local debug keystore.
+GitHub Actions restores a single private keystore from the repository secret
+`ANDROID_KEYSTORE_B64` and signs every release with that same identity. The
+keystore itself is never committed. This allows future APKs with a higher
+versionCode to install over this fixed-signature build without uninstalling it.
+The first fixed-signature build establishes the new update identity; APKs from
+older ephemeral-debug-key runs may still require one final uninstall/reinstall.
