@@ -102,11 +102,14 @@ jobs:
               for line in (root/f"time-{q}.txt").read_text().splitlines():
                   if "=" in line:
                       k,v=line.split("=",1); metrics[k]=float(v)
+              valid_signal=channels==1 and rate==44100 and frames>100 and rms>20 and peak>100
               row={"variant":q,"sample_rate":rate,"channels":channels,"frames":frames,
                    "duration_s":frames/rate if rate else 0,"rms_pcm16":rms,"peak_pcm16":peak,
-                   "wav_bytes":p.stat().st_size,**metrics}
-              assert channels==1 and rate==44100 and frames>100 and rms>20 and peak>100,row
+                   "wav_bytes":p.stat().st_size,"valid_signal":valid_signal,**metrics}
               rows.append(row)
+          by={x["variant"]:x for x in rows}
+          assert by["q2"]["valid_signal"],by["q2"]
+          assert by["q8"]["valid_signal"],by["q8"]
           (root/"comparison.json").write_text(json.dumps(rows,indent=2)+"\n")
           print(json.dumps(rows,indent=2))
           PY
