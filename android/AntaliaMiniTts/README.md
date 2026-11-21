@@ -109,3 +109,13 @@ from an earlier position. STOPPED is now logged separately as `client_stopped`,
 acknowledged with `done()`, and never converted into a synthesis error. Genuine
 delivery errors still report `ERROR_OUTPUT`. This preserves the Android TTS protocol
 while keeping the diagnostic distinction explicit.
+
+
+### Delivery termination correction
+
+AOSP's playback callback can already be in STOPPED/output-error state when
+`audioAvailable()` returns non-success; some paths surface a stopped callback as
+the generic ERROR return. Antalia therefore no longer calls `callback.error()`
+after any non-successful audio delivery. It stops producing PCM and calls `done()`
+so Android preserves and dispatches the callback's existing status. Diagnostics
+record both the `audioStatus` and `doneStatus` for the next incident.

@@ -167,20 +167,20 @@ public final class AntaliaTtsService extends TextToSpeechService {
                     + " frames=" + totalFrames[0] + " stopped=" + stop.get()
                     + " profile=" + core.lastProfile());
             int finalDeliveryStatus = deliveryStatus.get();
-            if (finalDeliveryStatus == TextToSpeech.STOPPED) {
-                // The client/framework cancelled this utterance. This is not a
-                // synthesis failure: converting STOPPED into callback.error()
-                // makes reader apps legitimately treat a queue flush/cancel as
-                // an engine error and can trigger a retry from an earlier point.
+            if (finalDeliveryStatus != TextToSpeech.SUCCESS) {
+                // Do not call callback.error() here. audioAvailable() returning
+                // non-success means the framework callback already owns a STOPPED
+                // or output-error state. On AOSP the stopped state can surface from
+                // audioAvailable as ERROR on some client paths; overwriting it with
+                // error() converts a legitimate client stop/queue flush into an
+                // engine failure. done() lets the framework publish its own state.
                 int doneStatus = callback.done();
-                AntaliaDiagnostics.event(this, "tts_client_stop_ack",
-                    "request=" + sequence + " doneStatus=" + doneStatus
-                        + " packets=" + callbackPackets[0]);
-                outcome = "client_stopped";
-            } else if (finalDeliveryStatus != TextToSpeech.SUCCESS) {
-                callback.error(TextToSpeech.ERROR_OUTPUT);
-                callback.done();
-                outcome = "audio_delivery_error";
+                AntaliaDiagnostics.event(this, "tts_delivery_terminated",
+                    "request=" + sequence + " audioStatus=" + finalDeliveryStatus
+                        + " doneStatus=" + doneStatus + " packets=" + callbackPackets[0]);
+                outcome = (finalDeliveryStatus == TextToSpeech.STOPPED
+                        || doneStatus == TextToSpeech.STOPPED)
+                    ? "client_stopped" : "delivery_terminated";
             } else if (!stop.get() && callbackPackets[0] == 0) {
                 callback.error(TextToSpeech.ERROR_SYNTHESIS);
                 callback.done();
