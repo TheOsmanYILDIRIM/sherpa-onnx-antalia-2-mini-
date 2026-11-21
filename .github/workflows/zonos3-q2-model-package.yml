@@ -52,20 +52,30 @@ jobs:
           print(info.sha)
           PY
 
-      - name: Quantize mmproj and smoke-test Turkish generation
+      - name: Selectively quantize mmproj and smoke-test Turkish generation
         shell: bash
         run: |
-          set -euo pipefail
+          set -u -o pipefail
           Q="$RUNNER_TEMP/llama-build/bin/llama-quantize"
           T="$RUNNER_TEMP/llama-build/bin/llama-tts"
           M="$RUNNER_TEMP/model"
-          "$Q" "$M/mmproj-bf16.gguf" "$M/mmproj-q8_0.gguf" Q8_0
-          "$Q" "$M/mmproj-bf16.gguf" "$M/mmproj-q4_k_m.gguf" Q4_K_M
-          "$Q" "$M/mmproj-bf16.gguf" "$M/mmproj-q3_k_m.gguf" Q3_K_M
-          "$Q" "$M/mmproj-bf16.gguf" "$M/mmproj-q2_k.gguf" Q2_K
-          for q in q8_0 q4_k_m q3_k_m q2_k; do
-            "$T" -m "$M/backbone-q2_k.gguf" -mm "$M/mmproj-$q.gguf" --tts-lang tr -p "Merhaba, bu kısa bir Türkçe ses denemesidir." -n 12 -o "$M/smoke-$q.wav"
-            python3 - "$M/smoke-$q.wav" <<'PY'
+          : > "$M/valid.txt"
+
+          # conversion/zonos3.py marks these tensors F32 because they are host-read,
+          # get_rows inputs, SSM/conv kernels or speaker-encoder conv operands.
+          # Generic llama-quantize otherwise changes some of them and libmtmd rejects
+          # the resulting mmproj (for example a.gen.wav.mixer.weight).
+          SAFE=(
+            --tensor-type '^voice\..*=f32'
+            --tensor-type '^a\.spk\..*=f32'
+            --tensor-type '\.table$=f32'
+            --tensor-type '\.dw\.weight$=f32'
+            --tensor-type '\.mixer\.weight$=f32'
+            --tensor-type '\.resample\.weight$=f32'
+          )
+
+          validate_wav() {
+            python3 - "$1" <<'PY'
           import sys,wave,array,os
           p=sys.argv[1]
           assert os.path.getsize(p)>1000,p
@@ -76,9 +86,31 @@ jobs:
               raw=w.readframes(w.getnframes())
           a=array.array("h");a.frombytes(raw)
           assert any(x for x in a),"silent output"
-          print(p,os.path.getsize(p))
+          print("VALID",p,os.path.getsize(p))
           PY
+          }
+
+          for spec in q8_0:Q8_0 q4_k_m:Q4_K_M q3_k_m:Q3_K_M q2_k:Q2_K; do
+            key="${spec%%:*}"
+            type="${spec#*:}"
+            out="$M/mmproj-$key.gguf"
+            wav="$M/smoke-$key.wav"
+            echo "::group::candidate $key"
+            if "$Q" "${SAFE[@]}" "$M/mmproj-bf16.gguf" "$out" "$type" &&
+               "$T" -m "$M/backbone-q2_k.gguf" -mm "$out" --tts-lang tr -p "Merhaba, bu kısa bir Türkçe ses denemesidir." -n 12 -o "$wav" &&
+               validate_wav "$wav"; then
+              echo "$key" >> "$M/valid.txt"
+              stat -c '%n %s bytes' "$out"
+            else
+              echo "candidate $key rejected" >&2
+              rm -f "$out" "$wav"
+            fi
+            echo "::endgroup::"
           done
+
+          test -s "$M/valid.txt"
+          echo "Working candidates:"
+          cat "$M/valid.txt"
 
       - name: Build SHA-verified external ZIP packages
         shell: bash
@@ -88,13 +120,23 @@ jobs:
           import hashlib,json,os,shutil,zipfile
           root=os.path.join(os.environ["RUNNER_TEMP"],"model")
           src=json.load(open(os.path.join(root,"source.json")))
+          valid={x.strip() for x in open(os.path.join(root,"valid.txt")) if x.strip()}
+          variants={
+              "q8_0":("Q2_K+Q8_0","mmproj-q8_0.gguf"),
+              "q4_k_m":("Q2_K+Q4_K_M","mmproj-q4_k_m.gguf"),
+              "q3_k_m":("Q2_K+Q3_K_M","mmproj-q3_k_m.gguf"),
+              "q2_k":("Q2_K+Q2_K","mmproj-q2_k.gguf"),
+          }
           out=os.path.join(os.environ["RUNNER_TEMP"],"packages");os.makedirs(out,exist_ok=True)
           def sha(p):
               h=hashlib.sha256()
               with open(p,"rb") as f:
                   for b in iter(lambda:f.read(1024*1024),b""):h.update(b)
               return h.hexdigest()
-          for variant,mm in [("Q2_K+Q8_0","mmproj-q8_0.gguf"),("Q2_K+Q4_K_M","mmproj-q4_k_m.gguf"),("Q2_K+Q3_K_M","mmproj-q3_k_m.gguf"),("Q2_K+Q2_K","mmproj-q2_k.gguf")]:
+          report=[]
+          for quant in ("q8_0","q4_k_m","q3_k_m","q2_k"):
+              if quant not in valid: continue
+              variant,mm=variants[quant]
               key=variant.replace("+","-").lower()
               d=os.path.join(out,key);os.makedirs(d)
               files={"backbone":"backbone-q2_k.gguf","mmproj":mm}
@@ -107,14 +149,20 @@ jobs:
               with zipfile.ZipFile(zpath,"w",compression=zipfile.ZIP_STORED) as z:
                   for name in ["zonos3-package.json",files["backbone"],files["mmproj"]]: z.write(os.path.join(d,name),name)
               with zipfile.ZipFile(zpath) as z: assert z.testzip() is None
-              print(zpath,os.path.getsize(zpath))
+              report.append({"variant":variant,"zip":os.path.basename(zpath),"zip_size":os.path.getsize(zpath),"backbone_size":manifest["files"]["backbone"]["size"],"mmproj_size":manifest["files"]["mmproj"]["size"]})
+          assert report
+          report.sort(key=lambda x:x["zip_size"])
+          with open(os.path.join(out,"report.json"),"w") as f:json.dump(report,f,indent=2)
+          print(json.dumps(report,indent=2))
           PY
-          ls -lh "$RUNNER_TEMP/packages"/*.zip
+          ls -lh "$RUNNER_TEMP/packages"/*.zip "$RUNNER_TEMP/packages/report.json"
 
       - uses: actions/upload-artifact@v4
         with:
           name: zonos3-mini-android-q2-model-zips
-          path: ${{ runner.temp }}/packages/*.zip
+          path: |
+            ${{ runner.temp }}/packages/*.zip
+            ${{ runner.temp }}/packages/report.json
           if-no-files-found: error
           compression-level: 0
           retention-days: 30
