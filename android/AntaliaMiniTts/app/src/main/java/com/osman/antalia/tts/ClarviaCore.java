@@ -3,6 +3,7 @@ package com.osman.antalia.tts;
 import android.content.Context;
 import ai.onnxruntime.OnnxTensor;
 import ai.onnxruntime.OrtEnvironment;
+import ai.onnxruntime.OrtException;
 import ai.onnxruntime.OrtSession;
 import com.chaquo.python.PyObject;
 import com.chaquo.python.Python;
@@ -17,11 +18,19 @@ import java.nio.LongBuffer;
 import java.security.MessageDigest;
 import java.util.HashMap;
 import java.util.Map;
+import java.util.concurrent.CancellationException;
+import java.util.concurrent.FutureTask;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicLong;
 
 final class ClarviaCore implements AutoCloseable {
     static final int RATE = 24000;
     private static final float PEAK = 0.99f;
+    private static final long PHONEMIZE_TIMEOUT_MS = 2000L;
+    private static final long ONNX_FIRST_ATTEMPT_TIMEOUT_MS = 4000L;
+    private static final long ONNX_RETRY_TIMEOUT_MS = 5000L;
     private static ClarviaCore singleton;
 
     interface AudioSink { boolean deliver(float[] audio); }
@@ -39,6 +48,7 @@ final class ClarviaCore implements AutoCloseable {
     private PyObject bridge;
     private int currentThreads = -1;
     private volatile String lastProfile = "";
+    private final AtomicLong runSequence = new AtomicLong();
 
     private ClarviaCore(Context context) {
         this.context = context;
@@ -136,13 +146,130 @@ final class ClarviaCore implements AutoCloseable {
         throw new IllegalStateException("Unexpected Clarvia audio tensor type: " + value.getClass());
     }
 
+    static long onnxBudgetMs(int attempt) {
+        return attempt <= 0 ? ONNX_FIRST_ATTEMPT_TIMEOUT_MS : ONNX_RETRY_TIMEOUT_MS;
+    }
+
+    static boolean shouldRetryInference(boolean stopped, int attempt) {
+        return !stopped && attempt == 0;
+    }
+
+    private String phonemizeWatched(String text, AtomicBoolean stop) throws Exception {
+        if (stop.get()) throw new CancellationException("TTS stopped");
+        final long started = android.os.SystemClock.elapsedRealtime();
+        AntaliaDiagnostics.event(context, "clarvia_phonemize_begin",
+            "chars=" + text.length() + " budgetMs=" + PHONEMIZE_TIMEOUT_MS);
+        FutureTask<String> task = new FutureTask<>(
+            () -> bridge.callAttr("phonemize_chunks_json", text).toString());
+        Thread worker = new Thread(task, "clarvia-phonemize-" + runSequence.incrementAndGet());
+        worker.setDaemon(true);
+        worker.start();
+        try {
+            String payload = task.get(PHONEMIZE_TIMEOUT_MS, TimeUnit.MILLISECONDS);
+            AntaliaDiagnostics.event(context, "clarvia_phonemize_end",
+                "elapsedMs=" + Math.max(0L, android.os.SystemClock.elapsedRealtime() - started));
+            return payload;
+        } catch (TimeoutException timeout) {
+            task.cancel(true);
+            AntaliaDiagnostics.event(context, "clarvia_phonemize_timeout",
+                "elapsedMs=" + Math.max(0L, android.os.SystemClock.elapsedRealtime() - started)
+                    + " budgetMs=" + PHONEMIZE_TIMEOUT_MS);
+            throw timeout;
+        }
+    }
+
+    private OrtSession.Result runWatched(Map<String, OnnxTensor> input, AtomicBoolean stop,
+                                         int chunkIndex, int attempt, int complexity) throws Exception {
+        if (stop.get()) throw new CancellationException("TTS stopped");
+        final long budgetMs = onnxBudgetMs(attempt);
+        final long started = android.os.SystemClock.elapsedRealtime();
+        final AtomicBoolean active = new AtomicBoolean(true);
+        final AtomicBoolean timedOut = new AtomicBoolean(false);
+        final AtomicBoolean terminateRequested = new AtomicBoolean(false);
+        final long runId = runSequence.incrementAndGet();
+        AntaliaDiagnostics.event(context, "clarvia_onnx_begin",
+            "run=" + runId + " chunk=" + chunkIndex + " attempt=" + (attempt + 1)
+                + " phonemes=" + complexity + " budgetMs=" + budgetMs);
+        try (OrtSession.RunOptions runOptions = new OrtSession.RunOptions()) {
+            Thread watcher = new Thread(() -> {
+                while (active.get()) {
+                    try {
+                        Thread.sleep(50L);
+                    } catch (InterruptedException interrupted) {
+                        if (!active.get()) return;
+                    }
+                    if (!active.get()) return;
+                    long elapsed = Math.max(0L, android.os.SystemClock.elapsedRealtime() - started);
+                    boolean timeout = elapsed > budgetMs;
+                    if (timeout && timedOut.compareAndSet(false, true)) {
+                        AntaliaDiagnostics.event(context, "clarvia_onnx_timeout",
+                            "run=" + runId + " chunk=" + chunkIndex
+                                + " attempt=" + (attempt + 1)
+                                + " elapsedMs=" + elapsed + " budgetMs=" + budgetMs);
+                    }
+                    if ((timeout || stop.get())
+                            && terminateRequested.compareAndSet(false, true)) {
+                        String reason = timeout ? "timeout" : "stop";
+                        AntaliaDiagnostics.event(context, "clarvia_terminate_begin",
+                            "run=" + runId + " chunk=" + chunkIndex
+                                + " attempt=" + (attempt + 1) + " reason=" + reason);
+                        try {
+                            runOptions.setTerminate(true);
+                            AntaliaDiagnostics.event(context, "clarvia_terminate_end",
+                                "run=" + runId + " chunk=" + chunkIndex
+                                    + " attempt=" + (attempt + 1) + " reason=" + reason);
+                        } catch (Exception error) {
+                            AntaliaDiagnostics.exception(context, "clarvia_terminate_error",
+                                "run=" + runId + " chunk=" + chunkIndex
+                                    + " attempt=" + (attempt + 1) + " reason=" + reason, error);
+                        }
+                        return;
+                    }
+                }
+            }, "clarvia-watchdog-" + runId);
+            watcher.setDaemon(true);
+            watcher.setPriority(Thread.MAX_PRIORITY);
+            watcher.start();
+            try {
+                OrtSession.Result result = session.run(input, runOptions);
+                if (stop.get() || timedOut.get()) {
+                    result.close();
+                    if (timedOut.get()) {
+                        throw new TimeoutException("Clarvia ONNX inference timed out");
+                    }
+                    throw new CancellationException("TTS stopped");
+                }
+                AntaliaDiagnostics.event(context, "clarvia_onnx_end",
+                    "run=" + runId + " chunk=" + chunkIndex
+                        + " attempt=" + (attempt + 1)
+                        + " elapsedMs="
+                        + Math.max(1L, android.os.SystemClock.elapsedRealtime() - started));
+                return result;
+            } catch (OrtException error) {
+                AntaliaDiagnostics.exception(context, "clarvia_onnx_error",
+                    "run=" + runId + " chunk=" + chunkIndex
+                        + " attempt=" + (attempt + 1)
+                        + " timedOut=" + timedOut.get() + " stopped=" + stop.get(), error);
+                if (timedOut.get()) {
+                    TimeoutException timeout = new TimeoutException("Clarvia ONNX inference timed out");
+                    timeout.initCause(error);
+                    throw timeout;
+                }
+                throw error;
+            } finally {
+                active.set(false);
+                watcher.interrupt();
+            }
+        }
+    }
+
     synchronized void speak(String text, String androidVoiceName, float speed, float pitchShift,
                             float pitchRange, int threads, AtomicBoolean stop, AudioSink sink) throws Exception {
         prepare(threads);
         int voiceIndex = TtsVoiceRegistry.clarviaIndex(androidVoiceName);
         speed = Math.max(0.35f, Math.min(3.0f, speed));
         long started = android.os.SystemClock.elapsedRealtimeNanos();
-        String payload = bridge.callAttr("phonemize_chunks_json", text).toString();
+        String payload = phonemizeWatched(text, stop);
         JSONArray chunks = new JSONArray(payload);
         int samples = 0;
         for (int ci = 0; ci < chunks.length() && !stop.get(); ci++) {
@@ -165,20 +292,39 @@ final class ClarviaCore implements AutoCloseable {
                 input.put("speed", speedTensor);
                 input.put("pitch_shift", pitchShiftTensor);
                 input.put("pitch_range", pitchRangeTensor);
-                try (OrtSession.Result result = session.run(input)) {
-                    float[] audio = outputAudio(result.get(0).getValue());
-                    if (audio.length == 0) throw new IllegalStateException("Clarvia returned empty audio");
-                    float loudest = 0f;
-                    for (float sample : audio) if (Float.isFinite(sample)) loudest = Math.max(loudest, Math.abs(sample));
-                    if (loudest > PEAK) {
-                        float scale = PEAK / loudest;
-                        for (int i = 0; i < audio.length; i++) audio[i] = Float.isFinite(audio[i]) ? audio[i] * scale : 0f;
-                    } else {
-                        for (int i = 0; i < audio.length; i++) if (!Float.isFinite(audio[i])) audio[i] = 0f;
+                float[] audio = null;
+                for (int attempt = 0; attempt < 2 && !stop.get(); attempt++) {
+                    try (OrtSession.Result result = runWatched(
+                            input, stop, ci, attempt, ids.length)) {
+                        audio = outputAudio(result.get(0).getValue());
+                        if (audio.length == 0) {
+                            throw new IllegalStateException("Clarvia returned empty audio");
+                        }
+                        break;
+                    } catch (TimeoutException | OrtException failure) {
+                        AntaliaDiagnostics.exception(context, "clarvia_attempt_error",
+                            "chunk=" + ci + " attempt=" + (attempt + 1)
+                                + " stopped=" + stop.get(), failure);
+                        if (!shouldRetryInference(stop.get(), attempt)) throw failure;
+                        AntaliaDiagnostics.event(context, "clarvia_retry",
+                            "chunk=" + ci + " nextAttempt=" + (attempt + 2)
+                                + " reason=" + failure.getClass().getSimpleName());
+                        closeSession();
+                        prepare(threads);
                     }
-                    samples += audio.length;
-                    if (!sink.deliver(audio)) break;
                 }
+                if (stop.get()) break;
+                if (audio == null) throw new IllegalStateException("No Clarvia PCM after retry");
+                float loudest = 0f;
+                for (float sample : audio) if (Float.isFinite(sample)) loudest = Math.max(loudest, Math.abs(sample));
+                if (loudest > PEAK) {
+                    float scale = PEAK / loudest;
+                    for (int i = 0; i < audio.length; i++) audio[i] = Float.isFinite(audio[i]) ? audio[i] * scale : 0f;
+                } else {
+                    for (int i = 0; i < audio.length; i++) if (!Float.isFinite(audio[i])) audio[i] = 0f;
+                }
+                samples += audio.length;
+                if (!sink.deliver(audio)) break;
             }
         }
         double elapsed = (android.os.SystemClock.elapsedRealtimeNanos() - started) / 1e9;

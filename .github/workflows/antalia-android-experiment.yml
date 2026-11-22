@@ -248,7 +248,7 @@ jobs:
       - name: Upload compact ARM64 R8 release APK
         uses: actions/upload-artifact@v4
         with:
-          name: antalia-mini-1.0.1-arm64-r8-release
+          name: antalia-mini-1.0.1-arm64-r9-release
           path: android/AntaliaMiniTts/app/build/outputs/apk/release/app-release.apk
           if-no-files-found: error
           retention-days: 14
