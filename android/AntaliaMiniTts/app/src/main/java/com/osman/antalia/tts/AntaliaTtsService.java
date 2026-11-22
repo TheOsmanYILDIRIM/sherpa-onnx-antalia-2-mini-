@@ -70,16 +70,16 @@ public final class AntaliaTtsService extends TextToSpeechService {
         return onIsLanguageAvailable(lang,country,variant);
     }
 
-    @Override protected String onGetDefaultVoiceNameFor(String lang, String country, String variant) {
+    @Override public String onGetDefaultVoiceNameFor(String lang, String country, String variant) {
         if (onIsLanguageAvailable(lang, country, variant) == TextToSpeech.LANG_NOT_SUPPORTED) return null;
         return TtsVoiceRegistry.resolve(null, configuredVoice());
     }
 
-    @Override protected int onIsValidVoiceName(String voiceName) {
+    @Override public int onIsValidVoiceName(String voiceName) {
         return TtsVoiceRegistry.isKnown(voiceName) ? TextToSpeech.SUCCESS : TextToSpeech.ERROR;
     }
 
-    @Override protected int onLoadVoice(String voiceName) {
+    @Override public int onLoadVoice(String voiceName) {
         return onIsValidVoiceName(voiceName);
     }
 
