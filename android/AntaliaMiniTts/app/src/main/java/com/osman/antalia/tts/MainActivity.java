@@ -19,6 +19,7 @@ import android.widget.Button;
 import android.widget.ArrayAdapter;
 import android.widget.AdapterView;
 import android.widget.Spinner;
+import android.widget.SeekBar;
 import android.speech.tts.TextToSpeech;
 import android.speech.tts.Voice;
 import android.widget.EditText;
@@ -43,6 +44,8 @@ public final class MainActivity extends Activity {
     private Switch fastMode;
     private RadioGroup threadChoices;
     private Spinner voiceChoices;
+    private SeekBar pitchControl;
+    private TextView pitchValue;
     private TextToSpeech voicePreviewTts;
     private Button speakButton, stopButton, testButton, shareButton;
     private Switch keepAlive;
@@ -123,6 +126,24 @@ public final class MainActivity extends Activity {
         });
         page.addView(voiceChoices);
         page.addView(title("Novela/Moon+ gibi voice listesini kullanan okuyucularda Antalia ve 10 Clarvia sesi ayrı ayrı görünür. Voice seçmeyen okuyucular burada seçtiğiniz varsayılan sesi kullanır.",13));
+        page.addView(title("Pitch",20));
+        pitchValue = title("",14);
+        page.addView(pitchValue);
+        pitchControl = new SeekBar(this);
+        pitchControl.setMax(150);
+        int pitchPercent = getSharedPreferences(PREFS,MODE_PRIVATE).getInt("pitch_percent",100);
+        pitchControl.setProgress(Math.max(0,Math.min(150,pitchPercent-50)));
+        pitchValue.setText("Pitch: %" + (pitchControl.getProgress()+50));
+        pitchControl.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override public void onProgressChanged(SeekBar seekBar,int progress,boolean fromUser) {
+                int percent = progress + 50;
+                pitchValue.setText("Pitch: %" + percent);
+                getSharedPreferences(PREFS,MODE_PRIVATE).edit().putInt("pitch_percent",percent).apply();
+            }
+            @Override public void onStartTrackingTouch(SeekBar seekBar) {}
+            @Override public void onStopTrackingTouch(SeekBar seekBar) {}
+        });
+        page.addView(pitchControl);
         Button voiceTestButton = new Button(this);
         voiceTestButton.setText("Seçili sistem TTS sesini test et");
         page.addView(voiceTestButton);
@@ -277,6 +298,11 @@ public final class MainActivity extends Activity {
         }
     }
 
+    private float selectedPitch() {
+        return Math.max(0.5f, Math.min(2.0f,
+            getSharedPreferences(PREFS,MODE_PRIVATE).getInt("pitch_percent",100) / 100f));
+    }
+
     private String selectedVoiceName() {
         int position = voiceChoices == null ? 0 : voiceChoices.getSelectedItemPosition();
         String[] names = TtsVoiceRegistry.androidVoiceNames();
@@ -306,6 +332,7 @@ public final class MainActivity extends Activity {
                 return;
             }
             int set = voicePreviewTts.setVoice(chosen);
+            voicePreviewTts.setPitch(selectedPitch());
             int speak = set == TextToSpeech.SUCCESS
                 ? voicePreviewTts.speak("Merhaba, seçtiğiniz Türkçe ses sağlıklı çalışıyor.",
                     TextToSpeech.QUEUE_FLUSH, null, "antalia-voice-preview")
@@ -323,6 +350,8 @@ public final class MainActivity extends Activity {
         cmd.putExtra(AntaliaBackgroundService.EXTRA_TEXT, speech);
         cmd.putExtra(AntaliaBackgroundService.EXTRA_STEPS, fastMode.isChecked() ? 4 : 8);
         cmd.putExtra(AntaliaBackgroundService.EXTRA_THREADS, threads);
+        cmd.putExtra(AntaliaBackgroundService.EXTRA_VOICE, selectedVoiceName());
+        cmd.putExtra(AntaliaBackgroundService.EXTRA_PITCH, selectedPitch());
         try {
             startForegroundService(cmd); // visible/user-initiated; no background-start bypass
             requestNotificationPermission();

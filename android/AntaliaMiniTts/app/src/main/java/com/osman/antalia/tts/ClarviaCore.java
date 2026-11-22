@@ -136,8 +136,8 @@ final class ClarviaCore implements AutoCloseable {
         throw new IllegalStateException("Unexpected Clarvia audio tensor type: " + value.getClass());
     }
 
-    synchronized void speak(String text, String androidVoiceName, float speed, int threads,
-                            AtomicBoolean stop, AudioSink sink) throws Exception {
+    synchronized void speak(String text, String androidVoiceName, float speed, float pitchShift,
+                            float pitchRange, int threads, AtomicBoolean stop, AudioSink sink) throws Exception {
         prepare(threads);
         int voiceIndex = TtsVoiceRegistry.clarviaIndex(androidVoiceName);
         speed = Math.max(0.35f, Math.min(3.0f, speed));
@@ -156,15 +156,15 @@ final class ClarviaCore implements AutoCloseable {
                  OnnxTensor stressTensor = OnnxTensor.createTensor(env, LongBuffer.wrap(stress), new long[]{1, stress.length});
                  OnnxTensor voice = OnnxTensor.createTensor(env, LongBuffer.wrap(new long[]{voiceIndex}), new long[]{1});
                  OnnxTensor speedTensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(new float[]{speed}), new long[]{1});
-                 OnnxTensor pitchShift = OnnxTensor.createTensor(env, FloatBuffer.wrap(new float[]{0f}), new long[]{1});
-                 OnnxTensor pitchRange = OnnxTensor.createTensor(env, FloatBuffer.wrap(new float[]{1f}), new long[]{1})) {
+                 OnnxTensor pitchShiftTensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(new float[]{pitchShift}), new long[]{1});
+                 OnnxTensor pitchRangeTensor = OnnxTensor.createTensor(env, FloatBuffer.wrap(new float[]{pitchRange}), new long[]{1})) {
                 Map<String, OnnxTensor> input = new HashMap<>();
                 input.put("tokens", tokens);
                 input.put("stress", stressTensor);
                 input.put("voice", voice);
                 input.put("speed", speedTensor);
-                input.put("pitch_shift", pitchShift);
-                input.put("pitch_range", pitchRange);
+                input.put("pitch_shift", pitchShiftTensor);
+                input.put("pitch_range", pitchRangeTensor);
                 try (OrtSession.Result result = session.run(input)) {
                     float[] audio = outputAudio(result.get(0).getValue());
                     if (audio.length == 0) throw new IllegalStateException("Clarvia returned empty audio");

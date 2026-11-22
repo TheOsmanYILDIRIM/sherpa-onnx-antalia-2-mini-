@@ -145,9 +145,12 @@ public final class AntaliaTtsService extends TextToSpeechService {
             final int threads = getSharedPreferences("antalia_settings", MODE_PRIVATE)
                 .getInt("threads", 4);
             final int speechRate = request.getSpeechRate();
+            final int requestPitch = request.getPitch();
             float requestedSpeed = speechRate > 0 ? speechRate / 100f : 1f;
             final float speed = Math.max(.35f, Math.min(3f,
                 useClarvia ? requestedSpeed : .95f * requestedSpeed));
+            final float pitchScale = Math.max(.5f, Math.min(2f,
+                requestPitch > 0 ? requestPitch / 100f : 1f));
 
             PowerManager power = (PowerManager)getSystemService(POWER_SERVICE);
             lock = power.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "antalia:android-tts");
@@ -155,7 +158,7 @@ public final class AntaliaTtsService extends TextToSpeechService {
             AntaliaDiagnostics.event(this, "tts_core_enter",
                 "request=" + sequence + " voice=" + selectedVoice
                     + " steps=" + steps + " threads=" + threads
-                    + " speed=" + speed + " wakeLock=true");
+                    + " speed=" + speed + " pitch=" + pitchScale + " wakeLock=true");
 
             Function<float[], Boolean> deliver = audio -> {
                 if (stop.get()) return false;
@@ -198,8 +201,9 @@ public final class AntaliaTtsService extends TextToSpeechService {
             String profile;
             if (useClarvia) {
                 clarvia = ClarviaCore.shared(this);
-                clarvia.speak(speech, selectedVoice, speed, threads, stop,
-                    audio -> deliver.apply(audio));
+                clarvia.speak(speech, selectedVoice, speed,
+                    TtsVoiceRegistry.pitchScaleToSemitones(pitchScale), 1f,
+                    threads, stop, audio -> deliver.apply(audio));
                 profile = clarvia.lastProfile();
             } else {
                 core.speak(speech, steps, threads, speed, stop,

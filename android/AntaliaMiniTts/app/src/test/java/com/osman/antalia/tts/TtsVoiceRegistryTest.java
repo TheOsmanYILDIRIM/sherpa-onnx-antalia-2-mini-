@@ -18,6 +18,12 @@ public class TtsVoiceRegistryTest {
         assertEquals(9, TtsVoiceRegistry.clarviaIndex("clarvia-male_5-tr-TR"));
     }
 
+    @Test public void convertsPitchScaleToSemitones() {
+        assertEquals(0f, TtsVoiceRegistry.pitchScaleToSemitones(1f), .001f);
+        assertEquals(12f, TtsVoiceRegistry.pitchScaleToSemitones(2f), .001f);
+        assertEquals(-12f, TtsVoiceRegistry.pitchScaleToSemitones(.5f), .001f);
+    }
+
     @Test public void configuredVoiceIsFallbackForClientsWithoutVoiceLists() {
         assertEquals("clarvia-female_4-tr-TR",
             TtsVoiceRegistry.resolve(null, "clarvia-female_4-tr-TR"));

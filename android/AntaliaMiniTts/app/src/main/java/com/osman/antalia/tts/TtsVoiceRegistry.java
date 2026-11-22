@@ -56,6 +56,11 @@ final class TtsVoiceRegistry {
         return ANTALIA;
     }
 
+    static float pitchScaleToSemitones(float pitchScale) {
+        float safe = Math.max(0.5f, Math.min(2.0f, pitchScale));
+        return (float)(12.0 * (Math.log(safe) / Math.log(2.0)));
+    }
+
     static int indexOf(String name) {
         String[] names = androidVoiceNames();
         for (int i = 0; i < names.length; i++) if (names[i].equals(name)) return i;

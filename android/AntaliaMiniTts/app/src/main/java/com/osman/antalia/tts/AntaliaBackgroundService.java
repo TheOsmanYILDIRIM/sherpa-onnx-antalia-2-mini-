@@ -11,6 +11,7 @@ import android.content.pm.ServiceInfo;
 import android.media.AudioFormat;
 import android.media.AudioManager;
 import android.media.AudioTrack;
+import android.media.PlaybackParams;
 import android.os.Build;
 import android.os.IBinder;
 import android.os.PowerManager;
@@ -29,6 +30,8 @@ public final class AntaliaBackgroundService extends Service {
     static final String EXTRA_TEXT = "text";
     static final String EXTRA_STEPS = "steps";
     static final String EXTRA_THREADS = "threads";
+    static final String EXTRA_VOICE = "voice";
+    static final String EXTRA_PITCH = "pitch";
     static final String PREFS = "antalia_settings";
     static final String PREF_GUARD = "keep_alive";
     private static final String CHANNEL = "antalia_reading";
@@ -179,7 +182,9 @@ public final class AntaliaBackgroundService extends Service {
                 reading = true;
                 refreshOrStop();  // Promote immediately; Android's 5-second FGS deadline.
                 readAsync(text, intent.getIntExtra(EXTRA_STEPS, 4),
-                               intent.getIntExtra(EXTRA_THREADS, 4));
+                               intent.getIntExtra(EXTRA_THREADS, 4),
+                               intent.getStringExtra(EXTRA_VOICE),
+                               intent.getFloatExtra(EXTRA_PITCH, 1f));
                 break;
             case ACTION_STOP_READ:
                 cancelCurrent();
@@ -209,15 +214,18 @@ public final class AntaliaBackgroundService extends Service {
         }
         return pcm;
     }
-    private static AudioTrack newTrack() {
-        int min = AudioTrack.getMinBufferSize(AntaliaCore.RATE,
+    private static AudioTrack newTrack(int sampleRate, float playbackPitch) {
+        int min = AudioTrack.getMinBufferSize(sampleRate,
             AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT);
-        AudioTrack out = new AudioTrack(AudioManager.STREAM_MUSIC, AntaliaCore.RATE,
+        AudioTrack out = new AudioTrack(AudioManager.STREAM_MUSIC, sampleRate,
             AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT,
             Math.max(16384, min), AudioTrack.MODE_STREAM);
         if (out.getState() != AudioTrack.STATE_INITIALIZED) {
             out.release();
             throw new IllegalStateException("AudioTrack initialization failed");
+        }
+        if (Math.abs(playbackPitch - 1f) > .001f) {
+            out.setPlaybackParams(new PlaybackParams().setSpeed(1f).setPitch(playbackPitch));
         }
         out.play();
         return out;
@@ -229,9 +237,16 @@ public final class AntaliaBackgroundService extends Service {
             try { out.pause(); out.flush(); } catch (Exception ignored) {}
         }
     }
-    private void readAsync(String speech, int steps, int threads) {
+    private void readAsync(String speech, int steps, int threads, String requestedVoice, float requestedPitch) {
+        String configured = getSharedPreferences(PREFS, MODE_PRIVATE)
+            .getString(TtsVoiceRegistry.PREF_DEFAULT_VOICE, TtsVoiceRegistry.ANTALIA);
+        String voice = TtsVoiceRegistry.resolve(requestedVoice, configured);
+        float pitch = Math.max(.5f, Math.min(2f, requestedPitch));
+        boolean useClarvia = TtsVoiceRegistry.isClarvia(voice);
+        int sampleRate = useClarvia ? ClarviaCore.RATE : AntaliaCore.RATE;
         AntaliaDiagnostics.event(this, "background_read_begin",
-            "chars=" + speech.length() + " steps=" + steps + " threads=" + threads);
+            "chars=" + speech.length() + " voice=" + voice + " pitch=" + pitch
+                + " steps=" + steps + " threads=" + threads);
         cancelled.set(true);
         AtomicBoolean token = new AtomicBoolean();
         cancelled = token;
@@ -239,10 +254,32 @@ public final class AntaliaBackgroundService extends Service {
             if (token.get()) return;
             AudioTrack out = null;
             try {
-                out = newTrack();
+                // Clarvia has native pitch control. Antalia has no pitch input, so its
+                // in-app preview uses AudioTrack's real-time pitch control.
+                out = newTrack(sampleRate, useClarvia ? 1f : pitch);
                 track = out;
                 final AudioTrack output = out;
-                AntaliaCore.shared(this).speak(speech, steps, threads, .95f, token, audio -> {
+                ClarviaCore.AudioSink clarviaSink = audio -> {
+                    if (token.get()) return false;
+                    byte[] bytes = pcm16(audio);
+                    int at = 0;
+                    while (at < bytes.length && !token.get()) {
+                        int count = Math.min(16384, bytes.length - at);
+                        int wrote = output.write(bytes, at, count);
+                        if (wrote <= 0) {
+                            AntaliaDiagnostics.event(this, "background_audio_write_failed",
+                                "requested=" + count + " wrote=" + wrote + " voice=" + voice);
+                            return false;
+                        }
+                        at += wrote;
+                    }
+                    return !token.get();
+                };
+                if (useClarvia) {
+                    ClarviaCore.shared(this).speak(speech, voice, 1f,
+                        TtsVoiceRegistry.pitchScaleToSemitones(pitch), 1f, threads, token, clarviaSink);
+                } else {
+                    AntaliaCore.shared(this).speak(speech, steps, threads, .95f, token, audio -> {
                     if (token.get()) return false;
                     byte[] bytes = pcm16(audio);
                     int at = 0;
@@ -257,11 +294,12 @@ public final class AntaliaBackgroundService extends Service {
                         at += wrote;
                     }
                     return !token.get();
-                });
+                    });
+                }
             } catch (Exception e) {
                 if (!token.get()) {
                     AntaliaDiagnostics.exception(this, "background_read_error",
-                        "chars=" + speech.length(), e);
+                        "chars=" + speech.length() + " voice=" + voice + " pitch=" + pitch, e);
                     Log.e("AntaliaBackground", "Playback failed", e);
                 }
             } finally {
