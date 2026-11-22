@@ -73,6 +73,12 @@ jobs:
         with:
           gradle-version: '8.7'
 
+      - name: Test and compile Antalia code before release signing
+        shell: bash
+        run: |
+          set -euo pipefail
+          gradle -p android/AntaliaMiniTts :app:testDebugUnitTest :app:assembleDebug --stacktrace --no-daemon
+
       - name: Restore stable APK signing identity
         shell: bash
         env:

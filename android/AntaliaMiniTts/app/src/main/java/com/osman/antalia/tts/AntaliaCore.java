@@ -22,10 +22,6 @@ import java.util.Random;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.ConcurrentHashMap;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledFuture;
-import java.util.concurrent.TimeUnit;
 import android.os.SystemClock;
 import android.util.Log;
 
@@ -54,12 +50,6 @@ final class AntaliaCore implements AutoCloseable {
     private int currentThreads = -1;
     private int currentSteps = -1;
     private static AntaliaCore singleton;
-    private static final ScheduledExecutorService RUN_WATCHDOG =
-        Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread worker = new Thread(r, "antalia-onnx-watchdog");
-            worker.setDaemon(true);
-            return worker;
-        });
     private final ConcurrentHashMap<String, Long> typicalStageUnitUs = new ConcurrentHashMap<>();
     private static final String TIMING_PREFS = "antalia_watchdog_timings_v2";
 
@@ -289,8 +279,18 @@ final class AntaliaCore implements AutoCloseable {
             .edit().putLong(stage, next).apply();
     }
 
+    static boolean shouldTimeoutStage(long elapsedMs, long budgetMs,
+                                      long currentSequence, long startSequence,
+                                      long idleMs, long noProgressWindowMs) {
+        return elapsedMs > budgetMs
+            && currentSequence == startSequence
+            && idleMs > noProgressWindowMs;
+    }
+
     /** A run is killed only when it is both abnormally slow and has produced no
-     * pipeline progress heartbeat. Retry attempts widen the learned budget. */
+     * pipeline progress heartbeat. Each stage owns its watchdog thread so a native
+     * setTerminate() call that blocks can never poison watchdogs for later stages
+     * or later Android TTS requests. */
     private OrtSession.Result runWatched(OrtSession session, Map<String, OnnxTensor> inputs,
                                          AtomicBoolean stop, String stage, int complexity,
                                          int attempt, ProgressHeartbeat heartbeat) throws Exception {
@@ -306,29 +306,48 @@ final class AntaliaCore implements AutoCloseable {
                 + " baselineUnitUs=" + (baseline == null ? -1L : baseline));
         AtomicBoolean active = new AtomicBoolean(true);
         AtomicBoolean timedOut = new AtomicBoolean(false);
+        AtomicBoolean terminateRequested = new AtomicBoolean(false);
         try (OrtSession.RunOptions runOptions = new OrtSession.RunOptions()) {
-            ScheduledFuture<?> watcher = RUN_WATCHDOG.scheduleAtFixedRate(() -> {
-                if (!active.get()) return;
-                long elapsed = SystemClock.elapsedRealtime() - started;
-                boolean abnormallySlow = elapsed > budgetMs;
-                boolean noProgress = heartbeat.sequence() == startSequence
-                    && heartbeat.idleMs() > noProgressWindowMs;
-                boolean timeout = abnormallySlow && noProgress;
-                if (timeout && timedOut.compareAndSet(false, true)) {
-                    AntaliaDiagnostics.event(context, "onnx_stage_timeout",
-                        "stage=" + stage + " attempt=" + (attempt + 1)
-                            + " elapsedMs=" + elapsed + " budgetMs=" + budgetMs
-                            + " idleMs=" + heartbeat.idleMs());
-                }
-                if (timeout || stop.get()) {
-                    try { runOptions.setTerminate(true); }
-                    catch (Exception e) {
-                        AntaliaDiagnostics.exception(context, "onnx_terminate_error",
-                            "stage=" + stage + " attempt=" + (attempt + 1), e);
-                        Log.w("AntaliaTtsWatchdog", "Cannot terminate " + stage, e);
+            Thread watcher = new Thread(() -> {
+                while (active.get()) {
+                    try {
+                        Thread.sleep(100L);
+                    } catch (InterruptedException interrupted) {
+                        if (!active.get()) return;
+                    }
+                    if (!active.get()) return;
+                    long elapsed = SystemClock.elapsedRealtime() - started;
+                    long idle = heartbeat.idleMs();
+                    boolean timeout = shouldTimeoutStage(
+                        elapsed, budgetMs, heartbeat.sequence(), startSequence,
+                        idle, noProgressWindowMs);
+                    if (timeout && timedOut.compareAndSet(false, true)) {
+                        AntaliaDiagnostics.event(context, "onnx_stage_timeout",
+                            "stage=" + stage + " attempt=" + (attempt + 1)
+                                + " elapsedMs=" + elapsed + " budgetMs=" + budgetMs
+                                + " idleMs=" + idle);
+                    }
+                    if ((timeout || stop.get())
+                            && terminateRequested.compareAndSet(false, true)) {
+                        AntaliaDiagnostics.event(context, "onnx_terminate_begin",
+                            "stage=" + stage + " attempt=" + (attempt + 1)
+                                + " reason=" + (timeout ? "timeout" : "stop"));
+                        try {
+                            runOptions.setTerminate(true);
+                            AntaliaDiagnostics.event(context, "onnx_terminate_end",
+                                "stage=" + stage + " attempt=" + (attempt + 1));
+                        } catch (Exception e) {
+                            AntaliaDiagnostics.exception(context, "onnx_terminate_error",
+                                "stage=" + stage + " attempt=" + (attempt + 1), e);
+                            Log.w("AntaliaTtsWatchdog", "Cannot terminate " + stage, e);
+                        }
+                        return;
                     }
                 }
-            }, 250, 250, TimeUnit.MILLISECONDS);
+            }, "antalia-watchdog-" + stage + "-" + (attempt + 1));
+            watcher.setDaemon(true);
+            watcher.setPriority(Thread.MAX_PRIORITY);
+            watcher.start();
             try {
                 OrtSession.Result output = session.run(inputs, runOptions);
                 if (stop.get() || timedOut.get()) {
@@ -353,7 +372,7 @@ final class AntaliaCore implements AutoCloseable {
                 throw e;
             } finally {
                 active.set(false);
-                watcher.cancel(false);
+                watcher.interrupt();
             }
         }
     }

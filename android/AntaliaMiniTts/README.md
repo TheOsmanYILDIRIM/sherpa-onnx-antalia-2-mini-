@@ -130,3 +130,19 @@ keystore itself is never committed. This allows future APKs with a higher
 versionCode to install over this fixed-signature build without uninstalling it.
 The first fixed-signature build establishes the new update identity; APKs from
 older ephemeral-debug-key runs may still require one final uninstall/reinstall.
+
+
+## Isolated ONNX stage watchdog
+
+A device diagnostic captured a vocoder stage with a learned 1.5 s budget that was
+not terminated until roughly 9.7 s later. The previous implementation shared one
+scheduled watchdog thread across every ONNX stage and every TTS request. A native
+`RunOptions.setTerminate(true)` call triggered by an earlier client stop could block
+that one watchdog and leave later stages temporarily unmonitored.
+
+Each ONNX stage now owns an isolated daemon watchdog and issues at most one terminate
+request. A blocked native terminate can therefore affect only that stage's watchdog,
+not future requests. Diagnostics add `onnx_terminate_begin` / `onnx_terminate_end`;
+a begin without a matching end identifies a blocked native termination. Stage timeout
+still preserves the existing retry path when the Android client has not independently
+stopped the request.
