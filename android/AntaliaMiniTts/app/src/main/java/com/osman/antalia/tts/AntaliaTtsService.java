@@ -193,11 +193,28 @@ public final class AntaliaTtsService extends TextToSpeechService {
                 outcome = "cancelled";
             }
         } catch (Exception e) {
-            AntaliaDiagnostics.exception(this, "tts_request_error",
-                "request=" + sequence + " stopped=" + stop.get(), e);
-            Log.e("AntaliaTtsService", "External TTS synthesis failed", e);
-            outcome = "error";
-            if (!stop.get()) callback.error();
+            int finalDeliveryStatus = deliveryStatus.get();
+            boolean expectedClientStop = stop.get()
+                && (finalDeliveryStatus == TextToSpeech.SUCCESS
+                    || finalDeliveryStatus == TextToSpeech.STOPPED);
+            if (expectedClientStop) {
+                // Android may cancel an active utterance while ONNX Runtime is inside
+                // session.run(). The resulting OrtException/CancellationException is
+                // expected cancellation telemetry, not a synthesis failure.
+                AntaliaDiagnostics.event(this, "tts_request_cancelled",
+                    "request=" + sequence + " reason=client_stop"
+                        + " exception=" + e.getClass().getSimpleName());
+                Log.i("AntaliaTtsService",
+                    "TTS request cancelled by Android client: request=" + sequence);
+                outcome = "client_stopped";
+            } else {
+                AntaliaDiagnostics.exception(this, "tts_request_error",
+                    "request=" + sequence + " stopped=" + stop.get()
+                        + " deliveryStatus=" + finalDeliveryStatus, e);
+                Log.e("AntaliaTtsService", "External TTS synthesis failed", e);
+                outcome = "error";
+                if (!stop.get()) callback.error();
+            }
         } finally {
             if (lock != null && lock.isHeld()) lock.release();
             long endNs = SystemClock.elapsedRealtimeNanos();
