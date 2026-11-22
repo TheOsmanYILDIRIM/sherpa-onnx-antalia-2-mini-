@@ -118,6 +118,38 @@ jobs:
           set -euo pipefail
           gradle -p android/AntaliaMiniTts :app:testDebugUnitTest :app:assembleDebug --stacktrace --no-daemon
 
+      - name: Verify packaged Clarvia debug APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import hashlib,json
+          from pathlib import Path
+          from zipfile import ZipFile
+          apk=Path('android/AntaliaMiniTts/app/build/outputs/apk/debug/app-debug.apk')
+          assert apk.is_file(), apk
+          with ZipFile(apk) as z:
+              assert z.testzip() is None
+              names=z.namelist()
+              meta=json.loads(z.read('assets/clarvia/manifest.json'))
+              assert meta['sample_rate']==24000
+              assert len(meta['voices'])==10
+              assert hashlib.sha256(z.read('assets/clarvia/model.onnx')).hexdigest()==meta['model_sha256']
+              assert 'assets/clarvia/config.json' in names
+              assert any('chaquopy' in x.lower() for x in names), 'Chaquopy runtime/package missing'
+              assert any('libpython3.12.so' in x for x in names), 'Python 3.12 runtime missing'
+          assert apk.stat().st_size < 100000000, apk.stat().st_size
+          print('Verified Clarvia debug APK', apk, apk.stat().st_size, hashlib.sha256(apk.read_bytes()).hexdigest())
+          PY
+
+      - name: Upload Clarvia integration debug APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: antalia-mini-clarvia-arm64-debug
+          path: android/AntaliaMiniTts/app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
+          retention-days: 14
+
       - name: Restore stable APK signing identity
         shell: bash
         env:
