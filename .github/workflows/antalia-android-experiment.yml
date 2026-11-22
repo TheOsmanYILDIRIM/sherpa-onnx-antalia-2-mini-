@@ -21,6 +21,11 @@ jobs:
       - name: Checkout Sherpa-ONNX fork directly (no HayaiTTS)
         uses: actions/checkout@v4
 
+      - name: Set up Python 3.12
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
       - name: Download validated 1.0.1 text frontend assets
         uses: actions/download-artifact@v4
         with:
@@ -49,6 +54,40 @@ jobs:
             "${{ runner.temp }}/antalia-onnx" \
             "android/AntaliaMiniTts/app/src/main/assets/antalia" \
             "${{ runner.temp }}/antalia-last-good/app-debug.apk"
+
+      - name: Stage and smoke-test Clarvia Tiny
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 android/AntaliaMiniTts/prepare_clarvia.py \
+            "android/AntaliaMiniTts/app/src/main/assets/clarvia" \
+            "android/AntaliaMiniTts/app/src/main/python"
+          PYTHONPATH=android/AntaliaMiniTts/app/src/main/python python3 - <<'PY'
+          import json
+          from pathlib import Path
+          import numpy as np
+          import onnxruntime as ort
+          from clarvia_bridge import phonemize_chunks_json
+
+          base=Path("android/AntaliaMiniTts/app/src/main")
+          chunks=json.loads(phonemize_chunks_json("Merhaba, bugün deniz oldukça sakin görünüyor."))
+          assert chunks and len(chunks[0]["ids"]) == len(chunks[0]["stress"])
+          session=ort.InferenceSession(str(base/"assets/clarvia/model.onnx"),
+                                       providers=["CPUExecutionProvider"])
+          c=chunks[0]
+          audio,durations=session.run(None,{
+              "tokens":np.asarray([c["ids"]],dtype=np.int64),
+              "stress":np.asarray([c["stress"]],dtype=np.int64),
+              "voice":np.asarray([2],dtype=np.int64),
+              "speed":np.asarray([1.0],dtype=np.float32),
+              "pitch_shift":np.asarray([0.0],dtype=np.float32),
+              "pitch_range":np.asarray([1.0],dtype=np.float32),
+          })
+          wave=np.asarray(audio).reshape(-1)
+          assert wave.size > 4800 and np.isfinite(wave).all()
+          assert np.max(np.abs(wave)) > 1e-4
+          print("Clarvia smoke OK:",wave.size/24000,"seconds")
+          PY
 
       - name: Set up JDK 21
         uses: actions/setup-java@v4
@@ -124,7 +163,7 @@ jobs:
           test -f "$ANTALIA_KEYSTORE_PATH"
           gradle -p android/AntaliaMiniTts :app:testReleaseUnitTest :app:assembleRelease --stacktrace --no-daemon
 
-      - name: Verify ARM64 APK contains exact four-stage original models
+      - name: Verify ARM64 APK contains Antalia and Clarvia TTS backends
         shell: bash
         run: |
           set -euo pipefail
@@ -154,8 +193,15 @@ jobs:
                            'known_words.json','english_i.json'):
                   assert 'assets/antalia/'+name in names,name
               assert 'assets/antalia/decoder.onnx' not in names
-          assert apk.stat().st_size < 35000000,f'APK exceeds 35 MB: {apk.stat().st_size}'
-          print('Verified original split ARM64 APK',apk,apk.stat().st_size,
+              clarvia=json.loads(z.read('assets/clarvia/manifest.json'))
+              assert clarvia['sample_rate']==24000
+              assert len(clarvia['voices'])==10
+              assert hashlib.sha256(z.read('assets/clarvia/model.onnx')).hexdigest()==clarvia['model_sha256']
+              assert 'assets/clarvia/config.json' in names
+              assert any('chaquopy' in x.lower() for x in names), 'Chaquopy runtime/package missing'
+              assert any('libpython3.12.so' in x for x in names), 'Python 3.12 runtime missing'
+          assert apk.stat().st_size < 80000000,f'APK exceeds 80 MB: {apk.stat().st_size}'
+          print('Verified Antalia + Clarvia ARM64 APK',apk,apk.stat().st_size,
                 hashlib.sha256(apk.read_bytes()).hexdigest())
           PY
 

@@ -16,6 +16,11 @@ import android.os.SystemClock;
 import android.view.View;
 import android.view.WindowManager;
 import android.widget.Button;
+import android.widget.ArrayAdapter;
+import android.widget.AdapterView;
+import android.widget.Spinner;
+import android.speech.tts.TextToSpeech;
+import android.speech.tts.Voice;
 import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.RadioButton;
@@ -37,6 +42,8 @@ public final class MainActivity extends Activity {
     private EditText input;
     private Switch fastMode;
     private RadioGroup threadChoices;
+    private Spinner voiceChoices;
+    private TextToSpeech voicePreviewTts;
     private Button speakButton, stopButton, testButton, shareButton;
     private Switch keepAlive;
     private String results = "";
@@ -80,7 +87,7 @@ public final class MainActivity extends Activity {
         page.setPadding(dp(18),dp(14),dp(18),dp(20));
         scroll.addView(page);
         page.addView(title("Antalia-2 Mini 1.0.1",24));
-        page.addView(title("Çevrimdışı Türkçe seslendirme • 48 kHz • ARM64",14));
+        page.addView(title("Çevrimdışı Türkçe seslendirme • Antalia 48 kHz + Clarvia 24 kHz • ARM64",14));
         input=new EditText(this);
         input.setSingleLine(false);
         input.setMinLines(4);
@@ -95,6 +102,31 @@ public final class MainActivity extends Activity {
         controls.addView(stopButton,new LinearLayout.LayoutParams(0,-2,1));
         page.addView(controls);
         page.addView(title("Ayarlar",23));
+        page.addView(title("Varsayılan sistem TTS sesi",20));
+        voiceChoices = new Spinner(this);
+        ArrayAdapter<String> voiceAdapter = new ArrayAdapter<>(this,
+            android.R.layout.simple_spinner_item, TtsVoiceRegistry.displayNames());
+        voiceAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
+        voiceChoices.setAdapter(voiceAdapter);
+        String savedVoice = getSharedPreferences(PREFS,MODE_PRIVATE)
+            .getString(TtsVoiceRegistry.PREF_DEFAULT_VOICE, TtsVoiceRegistry.ANTALIA);
+        voiceChoices.setSelection(TtsVoiceRegistry.indexOf(savedVoice));
+        voiceChoices.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
+            @Override public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
+                String[] names = TtsVoiceRegistry.androidVoiceNames();
+                if (position >= 0 && position < names.length) {
+                    getSharedPreferences(PREFS,MODE_PRIVATE).edit()
+                        .putString(TtsVoiceRegistry.PREF_DEFAULT_VOICE, names[position]).apply();
+                }
+            }
+            @Override public void onNothingSelected(AdapterView<?> parent) {}
+        });
+        page.addView(voiceChoices);
+        page.addView(title("Novela/Moon+ gibi voice listesini kullanan okuyucularda Antalia ve 10 Clarvia sesi ayrı ayrı görünür. Voice seçmeyen okuyucular burada seçtiğiniz varsayılan sesi kullanır.",13));
+        Button voiceTestButton = new Button(this);
+        voiceTestButton.setText("Seçili sistem TTS sesini test et");
+        page.addView(voiceTestButton);
+        voiceTestButton.setOnClickListener(v -> testSelectedSystemVoice());
         fastMode=new Switch(this);
         fastMode.setText("Hızlı mod (4 sentez adımı)");
         fastMode.setTextSize(18);
@@ -245,6 +277,45 @@ public final class MainActivity extends Activity {
         }
     }
 
+    private String selectedVoiceName() {
+        int position = voiceChoices == null ? 0 : voiceChoices.getSelectedItemPosition();
+        String[] names = TtsVoiceRegistry.androidVoiceNames();
+        return position >= 0 && position < names.length ? names[position] : TtsVoiceRegistry.ANTALIA;
+    }
+
+    private void testSelectedSystemVoice() {
+        final String requested = selectedVoiceName();
+        if (voicePreviewTts != null) {
+            try { voicePreviewTts.stop(); voicePreviewTts.shutdown(); } catch (Exception ignored) {}
+            voicePreviewTts = null;
+        }
+        message("Sistem TTS testi hazırlanıyor: " + requested);
+        voicePreviewTts = new TextToSpeech(this, statusCode -> {
+            if (statusCode != TextToSpeech.SUCCESS || voicePreviewTts == null) {
+                message("Sistem TTS başlatılamadı.");
+                return;
+            }
+            Voice chosen = null;
+            if (voicePreviewTts.getVoices() != null) {
+                for (Voice voice : voicePreviewTts.getVoices()) {
+                    if (requested.equals(voice.getName())) { chosen = voice; break; }
+                }
+            }
+            if (chosen == null) {
+                message("Seçili voice Android listesinde bulunamadı: " + requested);
+                return;
+            }
+            int set = voicePreviewTts.setVoice(chosen);
+            int speak = set == TextToSpeech.SUCCESS
+                ? voicePreviewTts.speak("Merhaba, seçtiğiniz Türkçe ses sağlıklı çalışıyor.",
+                    TextToSpeech.QUEUE_FLUSH, null, "antalia-voice-preview")
+                : TextToSpeech.ERROR;
+            message(speak == TextToSpeech.SUCCESS
+                ? "Sistem TTS testi başladı: " + requested
+                : "Sistem TTS testi başlatılamadı: " + requested);
+        }, getPackageName());
+    }
+
     private void speak() {
         String speech = input.getText().toString();
         if (speech.trim().isEmpty()) { message("Lütfen metin girin."); return; }
@@ -303,7 +374,11 @@ public final class MainActivity extends Activity {
     }
     @Override public void onDestroy() {
         cancelled.set(true);worker.shutdownNow();
-        // The shared engine also serves the Android system TTS service.
+        if (voicePreviewTts != null) {
+            try { voicePreviewTts.stop(); voicePreviewTts.shutdown(); } catch (Exception ignored) {}
+            voicePreviewTts = null;
+        }
+        // The shared engines also serve the Android system TTS service.
         super.onDestroy();
     }
 }

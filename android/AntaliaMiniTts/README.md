@@ -146,3 +146,26 @@ not future requests. Diagnostics add `onnx_terminate_begin` / `onnx_terminate_en
 a begin without a matching end identifies a blocked native termination. Stage timeout
 still preserves the existing retry path when the Android client has not independently
 stopped the request.
+
+
+## Clarvia Tiny multi-voice Android TTS integration
+
+The same Android TTS engine now exposes **11 selectable Turkish voices** to Android clients:
+the original `antalia-mini-tr-TR` plus all 10 public
+`wite-tech/clarvia-tts-tiny` voices. Voice-aware readers such as Novela can enumerate
+and persist each Clarvia voice separately. Readers which don't expose Android's voice
+list fall back to the voice selected in Antalia Mini's own **Varsayılan sistem TTS sesi**
+setting.
+
+Clarvia uses its original 24 kHz mono ONNX graph without re-quantization. The build resolves
+the exact Hugging Face model and `clarvia-phonemizer` revisions, records them with SHA-256
+in `assets/clarvia/manifest.json`, packages the pure-Python phonemizer through Chaquopy,
+and verifies a real Turkish ONNX synthesis before building the APK. Antalia remains 48 kHz
+and keeps its existing 4/8-step controls; Clarvia is a single-pass FastSpeech2-style model
+and therefore has no synthesis-step control.
+
+CI validates the 11-name Android voice registry, both debug and signed release builds, the
+Clarvia Turkish frontend/model smoke synthesis, packaged model hashes and APK signature.
+Real Novela UI enumeration and long-reading behavior still require an installed-device test;
+the in-app **Seçili sistem TTS sesini test et** button exercises the same Android
+`TextToSpeechService` route used by external readers.
